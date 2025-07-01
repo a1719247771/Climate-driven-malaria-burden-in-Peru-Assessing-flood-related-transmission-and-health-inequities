@@ -1,0 +1,18 @@
+"Metric","Value"
+"Flood effect coefficient (β_flood)",0.4475
+"Coefficient standard error",0.1001
+"Coefficient 95% CI lower bound",0.2513
+"Coefficient 95% CI upper bound",0.6437
+"Rate Ratio",1.564
+"PAF point estimate (%)",36.08
+"PAF 95% CI lower bound (%)",22.22
+"PAF 95% CI upper bound (%)",47.46
+"Total malaria cases",1175932
+"Total flood observations",24049
+"Flood occurrence rate (%)",3.61
+"Attributable cases point estimate",15128
+"Attributable cases 95% CI lower bound",9319
+"Attributable cases 95% CI upper bound",19903
+"Overall attribution rate point estimate (%)",1.29
+"Overall attribution rate 95% CI lower bound (%)",0.79
+"Overall attribution rate 95% CI upper bound (%)",1.69
