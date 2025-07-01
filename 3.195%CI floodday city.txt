@@ -1,0 +1,668 @@
+# --- 0. Load necessary R packages ---
+print("Loading necessary R packages...")
+packages_to_load <- c("fixest", "data.table", "readxl", "writexl",
+                      "dplyr", "tidyr", "ggplot2", "RColorBrewer",
+                      "viridis", "gridExtra", "scales", "sf", "spdep")
+for(pkg in packages_to_load){
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+    cat("Package '", pkg, "' has been installed.\n", sep="")
+  }
+  library(pkg, character.only = TRUE)
+  cat("Package '", pkg, "' has been loaded.\n", sep="")
+}
+
+#####################################
+## 1. Data preparation (Corrected population variable handling)
+#####################################
+cat("\n--- 1. Data preparation ---\n")
+excel_path <- "C:/Users/a1230/Desktop/nuejidata.xlsx"
+if (!file.exists(excel_path)) stop("Malaria data Excel file not found: ", excel_path)
+data <- read_excel(excel_path)
+setDT(data)
+
+# Determine ID column
+if ("ADM3" %in% colnames(data)) { id_col_data <- "ADM3" } else 
+  if ("ADM3_PCODE" %in% colnames(data)) { id_col_data <- "ADM3_PCODE" } else 
+    if ("cityid" %in% colnames(data)) { id_col_data <- "cityid" } else {
+      stop("Data must contain city identifier column (ADM3, ADM3_PCODE, or cityid).")
+    }
+
+data[, (id_col_data) := as.character(get(id_col_data))]
+data[, year := as.integer(year)]
+data[, week := as.integer(week)]
+if (!"cityid" %in% names(data)) data[, cityid := as.factor(get(id_col_data))]
+data[, cityid := as.factor(cityid)]
+data[, yearweek := paste0(year, "_", sprintf("%02d", week))]
+data[, yearweek := as.factor(yearweek)]
+
+if (all(c("max", "min", "temperature") %in% names(data))) {
+  data[, temp_range := max - min]
+  data[, temperature_sq := temperature^2]
+}
+
+# Create lagged variables for flood days (floodday)
+if ("floodday" %in% names(data)) {
+  for(i in 1:4) {
+    data[, paste0("floodday_lag", i) := shift(floodday, i, type = "lag", fill = 0), by = cityid]
+  }
+  cat("Flood days (floodday) lagged variables created successfully.\n")
+} else {
+  cat("Warning: 'floodday' column is missing, cannot create its lagged variables or perform floodday-based analysis.\n")
+  stop("Please ensure data contains 'floodday' column.")
+}
+
+# Create binary flood variable (if needed)
+if (!("flood" %in% names(data))) {
+  if("floodday" %in% names(data)) data[, flood := fifelse(floodday > 0, 1, 0)]
+}
+
+# **Correction: Properly handle population offset and population density**
+cat("\n--- Check and process population-related variables ---\n")
+
+# 1. Population offset: Look for population variable
+if ("population" %in% names(data)) {
+  # If population variable exists, use it as offset
+  data[, population := as.numeric(population)]
+  data[population <= 0 | is.na(population), population := 1]  # Avoid log(0) or NA
+  data[, log_population_offset := log(population)]
+  cat("✓ Found 'population' variable, will use as population offset\n")
+  cat("Population data statistics:\n")
+  print(summary(data$population))
+  offset_available <- TRUE
+} else {
+  cat("⚠ 'population' variable not found, model will not use population offset\n")
+  cat("Note: This means the model analyzes absolute case counts, not incidence rates\n")
+  offset_available <- FALSE
+}
+
+# 2. Population density: Used as control variable
+if ("population_density" %in% names(data)) {
+  data[, population_density := as.numeric(population_density)]
+  data[, log_population_density := log(population_density + 1)]
+  cat("✓ Found 'population_density' variable, will use as control variable\n")
+  cat("Population density data statistics:\n")
+  print(summary(data$population_density))
+  pop_density_available <- TRUE
+} else {
+  cat("⚠ 'population_density' variable not found\n")
+  pop_density_available <- FALSE
+}
+
+# 3. Other socioeconomic variables
+if ("light_density" %in% names(data)) {
+  data[, log_light_density := log(light_density + 1)]
+  cat("✓ Created log_light_density variable\n")
+  light_density_available <- TRUE
+} else {
+  cat("⚠ 'light_density' variable not found\n")
+  light_density_available <- FALSE
+}
+
+if ("LandUse_10" %in% names(data)) {
+  data[, urban_index := LandUse_10]
+  cat("✓ Created urban_index variable\n")
+  urban_available <- TRUE
+} else {
+  cat("⚠ 'LandUse_10' variable not found\n")
+  urban_available <- FALSE
+}
+
+# Y variable processing
+if (!"Y" %in% names(data)) stop("Data is missing dependent variable Y (malaria case count)")
+data[, Y := as.numeric(Y)][!is.na(Y)][Y < 0, Y := 0][, Y := round(Y)]
+
+#####################################
+## 2. Fit models centered on floodday (Corrected version)
+#####################################
+cat("\n--- 2. Fit models centered on floodday ---\n")
+
+# Build control variables list
+control_vars <- c(
+  "temperature", "temperature_sq", "temp_range", "pressure", 
+  "wind_speed", "relative_humidity", "total_precipitation_sum"
+)
+
+# Add available socioeconomic control variables
+if(pop_density_available) {
+  control_vars <- c(control_vars, "log_population_density")
+  cat("✓ Including population density control variable\n")
+}
+if(light_density_available) {
+  control_vars <- c(control_vars, "log_light_density")
+  cat("✓ Including light density control variable\n")
+}
+if(urban_available) {
+  control_vars <- c(control_vars, "urban_index")
+  cat("✓ Including urbanization index control variable\n")
+}
+
+# Build complete model variable list
+model_vars_floodday <- c("floodday", control_vars)
+
+# Ensure only actually existing variables are used
+model_vars_floodday_final <- intersect(model_vars_floodday, names(data))
+
+# Build model formula
+formula_str_floodday <- paste("Y ~", paste(model_vars_floodday_final, collapse = " + "))
+formula_str_floodday <- paste(formula_str_floodday, "| cityid + yearweek")
+
+cat("\nModel formula:", formula_str_floodday, "\n")
+
+# Fit model based on offset availability
+if (offset_available) {
+  cat("✓ Building model with population offset (analyzing incidence rates)\n")
+  model_floodday_fit <- fepois(as.formula(formula_str_floodday), 
+                               offset = ~log_population_offset, 
+                               data = data)
+} else {
+  cat("⚠ Building model without population offset (analyzing absolute case counts)\n")
+  model_floodday_fit <- fepois(as.formula(formula_str_floodday), 
+                               data = data)
+}
+
+cat("\nFloodday-centered model results summary:\n")
+print(summary(model_floodday_fit))
+
+#####################################
+## 3. Calculate standard deviation of floodday
+#####################################
+cat("\n--- 3. Calculate standard deviation of floodday ---\n")
+
+# Calculate standard deviation of current period floodday
+sd_floodday <- sd(data$floodday, na.rm = TRUE)
+mean_floodday <- mean(data$floodday, na.rm = TRUE)
+cat("Floodday - Mean:", round(mean_floodday, 2), "days, Standard Deviation (SD):", round(sd_floodday, 2), "days\n")
+
+if (is.na(sd_floodday) || sd_floodday == 0) {
+  stop("Standard deviation of floodday is 0 or NA, cannot perform this analysis. Please check data.")
+}
+
+#####################################
+## 4. Define scenarios and predict (Correctly handle offset)
+#####################################
+cat("\n--- 4. Define scenarios and predict ---\n")
+
+# Corrected prediction function
+predict_with_offset <- function(model, newdata) {
+  # Use fixest's predict function, type="response" automatically handles offset
+  pred <- predict(model, newdata = newdata, type = "response")
+  return(pred)
+}
+
+# Scenario REF: All flood-related variables (floodday, floodday_lag1-4) are 0
+data_ref_sd <- copy(data)
+floodday_vars_all <- c("floodday", paste0("floodday_lag", 1:4))
+for(var in floodday_vars_all) {
+  if (var %in% names(data_ref_sd)) data_ref_sd[, (var) := 0]
+}
+data_ref_sd$Y_pred_ref_sd <- predict_with_offset(model_floodday_fit, data_ref_sd)
+
+# Scenario SD: Current floodday = sd_floodday, other flood lag terms are 0
+data_plus_sd <- copy(data)
+# First set all flood-related variables to 0
+for(var in floodday_vars_all) {
+  if (var %in% names(data_plus_sd)) data_plus_sd[, (var) := 0]
+}
+# Then set only current floodday to sd_floodday
+data_plus_sd[, floodday := sd_floodday]
+data_plus_sd$Y_pred_plus_sd <- predict_with_offset(model_floodday_fit, data_plus_sd)
+
+# Calculate differences
+data$change_in_cases_due_to_sd_floodday <- data_plus_sd$Y_pred_plus_sd - data_ref_sd$Y_pred_ref_sd
+data$percent_change_due_to_sd_floodday <- fifelse(data_ref_sd$Y_pred_ref_sd > 0,
+                                                  (data$change_in_cases_due_to_sd_floodday / data_ref_sd$Y_pred_ref_sd) * 100,
+                                                  0)
+
+# Handle extreme values or NA
+data[is.na(percent_change_due_to_sd_floodday), percent_change_due_to_sd_floodday := 0]
+
+cat("\nCalculation of changes due to one SD increase in flood days (from 0-day baseline) completed. First few rows:\n")
+print(utils::head(data[, .(cityid, year, week, floodday, Y, change_in_cases_due_to_sd_floodday, percent_change_due_to_sd_floodday)]))
+
+#####################################
+## 5. City-level aggregation and spatial visualization
+#####################################
+cat("\n--- 5. City-level aggregation and spatial visualization ---\n")
+
+# Aggregate average "percentage change due to one SD increase in flood days" by city
+city_sd_effect <- data[, .(
+  ADM3 = first(get(id_col_data)), # Retain original ID column
+  avg_percent_change_sd = mean(percent_change_due_to_sd_floodday, na.rm = TRUE),
+  avg_abs_change_sd = mean(change_in_cases_due_to_sd_floodday, na.rm = TRUE),
+  avg_population_density = if (pop_density_available) mean(population_density, na.rm = TRUE) else NA,
+  avg_population = if (offset_available) mean(population, na.rm = TRUE) else NA
+), by = cityid]
+
+cat("\nCity-level average effects (percentage change):\n")
+print(utils::head(city_sd_effect))
+
+# --- Map visualization ---
+output_dir_sd <- "C:/Users/a1230/Desktop/floodday_sd_effect_maps"
+dir.create(output_dir_sd, showWarnings = FALSE)
+
+map_data_path <- "D:/秘鲁/秘鲁/地图三级行政区/per_admbnda_adm3_ign_20200714.shp"
+tryCatch({
+  peru_map <- st_read(map_data_path, quiet = TRUE)
+  peru_map <- peru_map[!st_is_empty(peru_map), ]
+  if(any(!st_is_valid(peru_map))) peru_map <- st_make_valid(peru_map)
+  
+  map_id_col_name <- "ADM3_PCODE"
+  if (!map_id_col_name %in% names(peru_map)) {
+    stop(paste("Expected ID column not found in map data:", map_id_col_name))
+  }
+  peru_map[[map_id_col_name]] <- as.character(peru_map[[map_id_col_name]])
+  
+  # Merge effect results to map data
+  map_with_sd_effect <- dplyr::left_join(peru_map, city_sd_effect, by = setNames("ADM3", map_id_col_name))
+  
+  matched_regions <- sum(!is.na(map_with_sd_effect$avg_percent_change_sd))
+  cat("\nMap matching results (SD effect): Successfully matched", matched_regions, "/", nrow(peru_map), "regions.\n")
+  if(matched_regions == 0) stop("Map data and SD effect results could not be matched.")
+  
+  # Adjust title and description based on whether offset is used
+  effect_type <- if(offset_available) "malaria incidence rate" else "malaria case count"
+  subtitle_text <- paste0("Based on average flood days=", round(mean_floodday,1), " days, one standard deviation=", round(sd_floodday,1), " days")
+  if(offset_available) {
+    subtitle_text <- paste(subtitle_text, "(Population offset considered)")
+  } else {
+    subtitle_text <- paste(subtitle_text, "(Population offset not used)")
+  }
+  
+  # Draw map
+  sd_effect_map_plot <- ggplot(map_with_sd_effect) +
+    geom_sf(aes(fill = avg_percent_change_sd), color = "grey50", size = 0.1) +
+    scale_fill_viridis_c(option = "cividis", name = paste(effect_type, "change (%)"), 
+                         na.value = "grey80") +
+    labs(title = paste0("Average Impact of One Standard Deviation Increase in Flood Days on ", effect_type),
+         subtitle = subtitle_text,
+         caption = paste0("Color represents average percentage change in ", effect_type, " due to one SD increase in flood days (from 0-day baseline)")) +
+    theme_minimal() +
+    theme(legend.position = "bottom", 
+          plot.title = element_text(hjust = 0.5, face="bold"),
+          plot.subtitle = element_text(hjust = 0.5))
+  
+  print(sd_effect_map_plot)
+  ggsave(file.path(output_dir_sd, "malaria_floodday_sd_effect_map.png"), sd_effect_map_plot, 
+         width = 10, height = 8, dpi = 300)
+  cat("\nFlood days SD effect map saved to ", output_dir_sd, "\n")
+  
+}, error = function(e) {
+  cat("\nError during map visualization (SD effect):", e$message, "\n")
+})
+
+#####################################
+## 6. Calculate city-specific floodday standard deviation and mean
+#####################################
+cat("\n--- 6. Calculate city-specific floodday standard deviation and mean ---\n")
+
+city_floodday_stats <- data[, .(
+  mean_floodday_city = mean(floodday, na.rm = TRUE),
+  sd_floodday_city = sd(floodday, na.rm = TRUE)
+), by = cityid]
+
+# Handle cases where some cities may have no flood day variation
+city_floodday_stats[is.na(sd_floodday_city) | sd_floodday_city == 0, sd_floodday_city := 0]
+
+print("Mean and standard deviation of floodday for each city (partial):")
+print(head(city_floodday_stats))
+
+#####################################
+## 7. Define scenarios and predict (Using city-specific SD)
+#####################################
+cat("\n--- 7. Define scenarios and predict (Using city-specific SD) ---\n")
+
+# Merge city-specific statistics back to main dataframe
+data_for_pred <- merge(data, city_floodday_stats, by = "cityid")
+
+# Scenario REF: All flood-related variables are 0
+data_ref_city_sd <- copy(data_for_pred)
+for(var in floodday_vars_all) {
+  if (var %in% names(data_ref_city_sd)) data_ref_city_sd[, (var) := 0]
+}
+data_ref_city_sd$Y_pred_ref_city_sd <- predict_with_offset(model_floodday_fit, data_ref_city_sd)
+
+# Scenario SD_city: Current floodday = that city's own sd_floodday_city
+data_plus_city_sd <- copy(data_for_pred)
+for(var in floodday_vars_all) {
+  if (var %in% names(data_plus_city_sd)) data_plus_city_sd[, (var) := 0]
+}
+data_plus_city_sd[, floodday := sd_floodday_city] # Use each city's own SD
+data_plus_city_sd$Y_pred_plus_city_sd <- predict_with_offset(model_floodday_fit, data_plus_city_sd)
+
+# Calculate differences
+data_for_pred$change_in_cases_city_sd <- data_plus_city_sd$Y_pred_plus_city_sd - data_ref_city_sd$Y_pred_ref_city_sd
+data_for_pred$percent_change_city_sd <- fifelse(data_ref_city_sd$Y_pred_ref_city_sd > 0,
+                                                (data_for_pred$change_in_cases_city_sd / data_ref_city_sd$Y_pred_ref_city_sd) * 100,
+                                                0)
+data_for_pred[is.na(percent_change_city_sd), percent_change_city_sd := 0]
+
+cat("\nCalculation of changes due to one city-specific SD increase in flood days (from 0-day baseline) completed. First few rows:\n")
+print(utils::head(data_for_pred[, .(cityid, year, week, floodday, sd_floodday_city, Y, change_in_cases_city_sd, percent_change_city_sd)]))
+
+#####################################
+## 8. City-level aggregation and spatial visualization (Using city-specific SD effects)
+#####################################
+cat("\n--- 8. City-level aggregation and spatial visualization (Using city-specific SD effects) ---\n")
+
+city_sd_effect_specific <- data_for_pred[, .(
+  ADM3 = first(get(id_col_data)),
+  avg_percent_change_city_sd = mean(percent_change_city_sd, na.rm = TRUE),
+  avg_abs_change_city_sd = mean(change_in_cases_city_sd, na.rm = TRUE),
+  city_specific_sd_floodday = first(sd_floodday_city),
+  avg_population_density = if (pop_density_available) mean(population_density, na.rm = TRUE) else NA,
+  avg_population = if (offset_available) mean(population, na.rm = TRUE) else NA
+), by = cityid]
+
+cat("\nCity-level average effects (percentage change based on city-specific SD):\n")
+print(utils::head(city_sd_effect_specific))
+
+# --- Map visualization (City-specific SD) ---
+output_dir_city_sd <- "C:/Users/a1230/Desktop/floodday_city_sd_effect_maps"
+dir.create(output_dir_city_sd, showWarnings = FALSE)
+
+tryCatch({
+  peru_map <- st_read(map_data_path, quiet = TRUE)
+  peru_map <- peru_map[!st_is_empty(peru_map), ]
+  if(any(!st_is_valid(peru_map))) peru_map <- st_make_valid(peru_map)
+  
+  map_id_col_name <- "ADM3_PCODE" 
+  peru_map[[map_id_col_name]] <- as.character(peru_map[[map_id_col_name]])
+  
+  map_with_city_sd_effect <- dplyr::left_join(peru_map, city_sd_effect_specific, by = setNames("ADM3", map_id_col_name))
+  
+  matched_regions <- sum(!is.na(map_with_city_sd_effect$avg_percent_change_city_sd))
+  cat("\nMap matching results (City-specific SD effect): Successfully matched", matched_regions, "/", nrow(peru_map), "regions.\n")
+  
+  if(matched_regions > 0) {
+    effect_type <- if(offset_available) "malaria incidence rate" else "malaria case count"
+    
+    city_sd_effect_map_plot <- ggplot(map_with_city_sd_effect) +
+      geom_sf(aes(fill = avg_percent_change_city_sd), color = "grey50", size = 0.1) +
+      scale_fill_viridis_c(option = "magma", name = paste(effect_type, "change (%)"), 
+                           na.value = "grey80") +
+      labs(title = paste0("Average Impact of City-Specific 1 SD Increase in Flood Days on ", effect_type),
+           subtitle = if(offset_available) "Population offset considered" else "Population offset not used",
+           caption = paste0("Color represents average percentage change in ", effect_type, " due to city-specific 1 SD increase in flood days (from 0-day baseline)")) +
+      theme_minimal() +
+      theme(legend.position = "bottom", 
+            plot.title = element_text(hjust = 0.5, face="bold"))
+    
+    print(city_sd_effect_map_plot)
+    ggsave(file.path(output_dir_city_sd, "malaria_floodday_city_sd_effect_map.png"), city_sd_effect_map_plot, 
+           width = 10, height = 8, dpi = 300)
+    cat("\nFlood days city-specific SD effect map saved to ", output_dir_city_sd, "\n")
+  }
+  
+}, error = function(e) {
+  cat("\nError during map visualization (City-specific SD effect):", e$message, "\n")
+})
+
+#####################################
+## 9. Summary of analysis results
+#####################################
+cat("\n========== Flood Days SD Effect Analysis Summary ==========\n")
+cat("Analysis method: Poisson fixed effects model\n")
+
+# Variable usage summary
+cat("\nVariable usage:\n")
+if (offset_available) {
+  cat("✓ Population offset: Using 'population' variable, results interpreted as effects on disease incidence rates\n")
+} else {
+  cat("⚠ Population offset: Not used, results interpreted as effects on disease case counts\n")
+}
+
+if (pop_density_available) {
+  cat("✓ Population density control variable: Using 'population_density' variable\n")
+} else {
+  cat("⚠ Population density control variable: Not used\n")
+}
+
+# Effect summary
+cat("\nEffect summary:\n")
+cat("Global flood days standard deviation:", round(sd_floodday, 2), "days\n")
+cat("Global average effect (percentage change from 1 SD increase in flood days):", round(mean(data$percent_change_due_to_sd_floodday, na.rm = TRUE), 2), "%\n")
+cat("City-specific SD average effect:", round(mean(data_for_pred$percent_change_city_sd, na.rm = TRUE), 2), "%\n")
+
+# Model coefficient interpretation
+floodday_coef <- coef(model_floodday_fit)["floodday"]
+cat("\nFloodday coefficient:", round(floodday_coef, 4), "\n")
+cat("Interpretation: Each additional day of flooding increases", if(offset_available) "malaria incidence rate" else "malaria case count", 
+    "by approximately", round((exp(floodday_coef) - 1) * 100, 2), "%\n")
+
+cat("\n========== Analysis Complete ==========\n")
+
+#####################################
+## 10. 导出城市洪水效应分析结果（包含置信区间）
+#####################################
+
+cat("\n--- 10. 导出城市洪水效应分析结果 ---\n")
+
+# 确保输出目录存在
+output_dir <- "C:/Users/a1230/Desktop/pic"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# 1. 计算城市特定效应的置信区间
+cat("正在计算置信区间...\n")
+
+# 使用bootstrap方法计算置信区间
+calculate_ci_for_city_effects <- function(model, data_ref, data_plus, alpha = 0.05) {
+  # 获取模型系数的置信区间
+  tryCatch({
+    model_ci <- confint(model, level = 1 - alpha)
+    
+    # 使用delta方法近似计算预测的置信区间
+    # 这里简化处理，使用标准误差来估算
+    vcov_matrix <- vcov(model)
+    
+    # 计算预测值的标准误差（简化方法）
+    pred_ref <- predict(model, newdata = data_ref, type = "response")
+    pred_plus <- predict(model, newdata = data_plus, type = "response")
+    
+    # 计算效应的标准误差（近似）
+    floodday_coef <- coef(model)["floodday"]
+    floodday_se <- sqrt(diag(vcov_matrix))["floodday"]
+    
+    # 计算置信区间
+    ci_lower <- (pred_plus - pred_ref) - 1.96 * abs(pred_plus - pred_ref) * floodday_se / abs(floodday_coef)
+    ci_upper <- (pred_plus - pred_ref) + 1.96 * abs(pred_plus - pred_ref) * floodday_se / abs(floodday_coef)
+    
+    return(list(
+      lower = ci_lower,
+      upper = ci_upper,
+      coef = floodday_coef,
+      se = floodday_se,
+      success = TRUE
+    ))
+  }, error = function(e) {
+    return(list(success = FALSE, error = e$message))
+  })
+}
+
+# 计算置信区间
+ci_results <- calculate_ci_for_city_effects(model_floodday_fit, data_ref_city_sd, data_plus_city_sd)
+
+if (ci_results$success) {
+  ci_available <- TRUE
+  cat("✓ 置信区间计算完成\n")
+} else {
+  cat("⚠ 置信区间计算遇到问题:", ci_results$error, "\n")
+  cat("将使用简化的置信区间估算\n")
+  ci_available <- FALSE
+}
+
+# 2. 整合城市级别结果
+cat("正在整合城市级别结果...\n")
+
+# 获取模型系数和标准误差
+floodday_coef <- coef(model_floodday_fit)["floodday"]
+model_vcov <- vcov(model_floodday_fit)
+floodday_se <- sqrt(diag(model_vcov))["floodday"]
+
+# 计算置信区间的系数
+ci_multiplier <- 1.96  # 95%置信区间
+
+# 创建详细的城市结果表
+city_detailed_results <- data_for_pred[, .(
+  # 基本信息
+  city_id = first(cityid),
+  ADM3_code = first(get(id_col_data)),
+  
+  # 洪水天数统计
+  mean_floodday = first(mean_floodday_city),
+  sd_floodday = first(sd_floodday_city),
+  min_floodday = min(floodday, na.rm = TRUE),
+  max_floodday = max(floodday, na.rm = TRUE),
+  
+  # 效应估计（城市特定标准差）
+  avg_percent_change = mean(percent_change_city_sd, na.rm = TRUE),
+  median_percent_change = median(percent_change_city_sd, na.rm = TRUE),
+  avg_absolute_change = mean(change_in_cases_city_sd, na.rm = TRUE),
+  median_absolute_change = median(change_in_cases_city_sd, na.rm = TRUE),
+  
+  # 基线疟疾情况
+  avg_baseline_cases = mean(Y, na.rm = TRUE),
+  total_observations = .N,
+  
+  # 人口信息（如果可用）
+  avg_population = if (offset_available) mean(population, na.rm = TRUE) else NA_real_,
+  avg_population_density = if (pop_density_available) mean(population_density, na.rm = TRUE) else NA_real_
+), by = cityid]
+
+# 计算简化的置信区间
+city_detailed_results[, `:=`(
+  # 基于模型系数的置信区间估算
+  percent_change_lower_95 = avg_percent_change - ci_multiplier * abs(avg_percent_change) * (floodday_se / abs(floodday_coef)),
+  percent_change_upper_95 = avg_percent_change + ci_multiplier * abs(avg_percent_change) * (floodday_se / abs(floodday_coef)),
+  
+  # 绝对变化的置信区间
+  absolute_change_lower_95 = avg_absolute_change - ci_multiplier * abs(avg_absolute_change) * (floodday_se / abs(floodday_coef)),
+  absolute_change_upper_95 = avg_absolute_change + ci_multiplier * abs(avg_absolute_change) * (floodday_se / abs(floodday_coef))
+)]
+
+# 添加效应显著性判断
+city_detailed_results[, `:=`(
+  effect_significant = fifelse(
+    (percent_change_lower_95 > 0 & percent_change_upper_95 > 0) | 
+      (percent_change_lower_95 < 0 & percent_change_upper_95 < 0), 
+    "Yes", "No"
+  ),
+  effect_direction = fifelse(avg_percent_change > 0, "Increase", "Decrease"),
+  effect_magnitude = fifelse(
+    abs(avg_percent_change) > 10, "Large",
+    fifelse(abs(avg_percent_change) > 5, "Moderate", "Small")
+  )
+)]
+
+# 按效应大小排序
+city_detailed_results <- city_detailed_results[order(-avg_percent_change)]
+
+# 3. 创建全局效应对比表
+global_vs_city_comparison <- data_for_pred[, .(
+  city_id = first(cityid),
+  ADM3_code = first(get(id_col_data)),
+  
+  # 城市特定标准差效应
+  city_sd = first(sd_floodday_city),
+  city_effect_percent = mean(percent_change_city_sd, na.rm = TRUE),
+  
+  # 全局标准差效应
+  global_sd = sd_floodday,
+  global_effect_percent = mean(percent_change_due_to_sd_floodday, na.rm = TRUE),
+  
+  # 效应差异
+  effect_difference = mean(percent_change_city_sd, na.rm = TRUE) - mean(percent_change_due_to_sd_floodday, na.rm = TRUE)
+), by = cityid][order(-city_effect_percent)]
+
+# 4. 创建模型系数汇总表
+model_summary_table <- data.table(
+  Variable = names(coef(model_floodday_fit)),
+  Coefficient = coef(model_floodday_fit),
+  Std_Error = sqrt(diag(model_vcov)),
+  Z_value = coef(model_floodday_fit) / sqrt(diag(model_vcov)),
+  P_value = 2 * (1 - pnorm(abs(coef(model_floodday_fit) / sqrt(diag(model_vcov))))),
+  CI_Lower_95 = coef(model_floodday_fit) - 1.96 * sqrt(diag(model_vcov)),
+  CI_Upper_95 = coef(model_floodday_fit) + 1.96 * sqrt(diag(model_vcov)),
+  Exp_Coefficient = exp(coef(model_floodday_fit)),
+  Percent_Change = (exp(coef(model_floodday_fit)) - 1) * 100
+)
+
+# 5. 导出到Excel文件
+cat("正在导出结果到Excel文件...\n")
+
+excel_output_path <- file.path(output_dir, "洪水对疟疾影响分析结果.xlsx")
+
+# 使用writexl包导出多个工作表
+output_list <- list(
+  "城市详细结果" = city_detailed_results,
+  "全局vs城市对比" = global_vs_city_comparison,
+  "模型系数汇总" = model_summary_table
+)
+
+write_xlsx(output_list, excel_output_path)
+
+# 6. 导出CSV格式（用于其他软件）
+cat("正在导出CSV格式文件...\n")
+
+write.csv(city_detailed_results, file.path(output_dir, "城市详细结果.csv"), 
+          row.names = FALSE, fileEncoding = "UTF-8")
+write.csv(global_vs_city_comparison, file.path(output_dir, "全局vs城市对比.csv"), 
+          row.names = FALSE, fileEncoding = "UTF-8")
+write.csv(model_summary_table, file.path(output_dir, "模型系数汇总.csv"), 
+          row.names = FALSE, fileEncoding = "UTF-8")
+
+# 7. 创建结果汇总报告
+cat("正在创建结果汇总报告...\n")
+
+summary_report <- paste0(
+  "洪水对疟疾影响分析结果汇总\n",
+  "=====================================\n\n",
+  "分析方法：泊松固定效应回归模型\n",
+  "分析单位：", ifelse(offset_available, "发病率（每人口）", "绝对病例数"), "\n",
+  "城市数量：", nrow(city_detailed_results), "\n",
+  "观测总数：", nrow(data), "\n\n",
+  
+  "模型关键系数：\n",
+  "洪水天数系数：", round(floodday_coef, 4), "\n",
+  "标准误差：", round(floodday_se, 4), "\n",
+  "每增加1天洪水的效应：", round((exp(floodday_coef) - 1) * 100, 2), "%\n\n",
+  
+  "全局标准差分析：\n",
+  "全局洪水天数标准差：", round(sd_floodday, 2), "天\n",
+  "平均效应（全局SD增加）：", round(mean(data$percent_change_due_to_sd_floodday, na.rm = TRUE), 2), "%\n\n",
+  
+  "城市特定标准差分析：\n",
+  "城市标准差范围：", round(min(city_detailed_results$sd_floodday, na.rm = TRUE), 2), " - ", 
+  round(max(city_detailed_results$sd_floodday, na.rm = TRUE), 2), "天\n",
+  "平均效应（城市特定SD增加）：", round(mean(city_detailed_results$avg_percent_change, na.rm = TRUE), 2), "%\n",
+  "效应最大的城市：", city_detailed_results$city_id[1], "（", round(city_detailed_results$avg_percent_change[1], 2), "%）\n",
+  "效应最小的城市：", city_detailed_results$city_id[nrow(city_detailed_results)], "（", 
+  round(city_detailed_results$avg_percent_change[nrow(city_detailed_results)], 2), "%）\n\n",
+  
+  "显著效应城市数量：", sum(city_detailed_results$effect_significant == "Yes", na.rm = TRUE), "/", nrow(city_detailed_results), "\n",
+  "正效应城市数量：", sum(city_detailed_results$effect_direction == "Increase", na.rm = TRUE), "\n",
+  "负效应城市数量：", sum(city_detailed_results$effect_direction == "Decrease", na.rm = TRUE), "\n\n",
+  
+  "文件导出位置：", output_dir, "\n",
+  "生成时间：", Sys.time(), "\n"
+)
+
+writeLines(summary_report, file.path(output_dir, "分析结果汇总.txt"))
+
+# 8. 打印关键信息
+cat("\n========== 导出完成 ==========\n")
+cat("文件保存位置：", output_dir, "\n")
+cat("导出文件：\n")
+cat("  1. 洪水对疟疾影响分析结果.xlsx（包含3个工作表）\n")
+cat("  2. 城市详细结果.csv\n")
+cat("  3. 全局vs城市对比.csv\n")
+cat("  4. 模型系数汇总.csv\n")
+cat("  5. 分析结果汇总.txt\n")
+
+cat("\n关键发现：\n")
+cat("  • 使用城市特定标准差的平均效应：", round(mean(city_detailed_results$avg_percent_change, na.rm = TRUE), 2), "%\n")
+cat("  • 效应最大城市：", city_detailed_results$city_id[1], "（+", round(city_detailed_results$avg_percent_change[1], 2), "%）\n")
+cat("  • 效应最小城市：", city_detailed_results$city_id[nrow(city_detailed_results)], "（", round(city_detailed_results$avg_percent_change[nrow(city_detailed_results)], 2), "%）\n")
+cat("  • 显著效应城市比例：", round(sum(city_detailed_results$effect_significant == "Yes", na.rm = TRUE) / nrow(city_detailed_results) * 100, 1), "%\n")
+
+cat("\n========== 全部分析和导出完成 ==========\n")

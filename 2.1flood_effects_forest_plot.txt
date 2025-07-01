@@ -1,0 +1,90 @@
+##################################################################
+# 1. Forest plot for flood-related variables - 修正纵轴排序
+##################################################################
+
+flood_vars <- comp_table %>% 
+  filter(grepl("^flood", variable)) %>%
+  pivot_longer(
+    cols = c(matches("model\\d_coef"), matches("model\\d_ci_low"), matches("model\\d_ci_high"), matches("model\\d_sig")),
+    names_to = c("model", ".value"),
+    names_pattern = "model(\\d)_(.*)"
+  ) %>%
+  mutate(
+    model = case_when(
+      model == "1" ~ "Model 1: Basic weather",
+      model == "2" ~ "Model 2: + Socioeconomic",
+      model == "3" ~ "Model 3: + Lag effects",
+      TRUE ~ paste("Model", model)
+    )
+  )
+
+# 关键修正：设置正确的因子水平顺序
+flood_vars$variable <- factor(flood_vars$variable, 
+                              levels = c("flood", "flood_lag1", "flood_lag2", "flood_lag3", "flood_lag4"))
+
+# 根据variable的顺序来排序var_label
+desired_order <- c("Flood event", "Flood event_lag1", "Flood event_lag 2", "Flood event_lag 3", "Flood event_lag 4")
+flood_vars$var_label <- factor(flood_vars$var_label, levels = desired_order)
+
+flood_forest_plot <- ggplot(flood_vars, aes(x = coef, y = var_label, color = model)) +
+  geom_vline(xintercept = 0, linetype = "solid", color = "grey40", size = 0.5) +
+  geom_point(position = position_dodge(width = 0.6), size = 3, alpha = 0.8) +
+  geom_errorbarh(aes(xmin = ci_low, xmax = ci_high), 
+                 height = 0.15, position = position_dodge(width = 0.6), 
+                 size = 0.7, alpha = 0.8) +
+  geom_text(aes(x = ci_high + 0.015, label = sig), 
+            position = position_dodge(width = 0.6), hjust = 0, size = 4, fontface = "bold") +
+  scale_color_manual(values = nature_colors[1:3]) +
+  # 翻转y轴，让flood event在顶部，lag效应按1,2,3,4顺序排列
+  scale_y_discrete(limits = rev(desired_order)) +
+  labs(
+    title = "Impact of floods and lag effects on malaria incidence",
+    subtitle = "Coefficient estimates from Poisson fixed-effects models with 95% confidence intervals",
+    x = "Coefficient estimate (95% CI)",
+    y = NULL,
+    color = "Model specification"
+  ) +
+  theme_nature() +
+  theme(
+    legend.position = "bottom",
+    axis.text.y = element_text(hjust = 1),
+    panel.grid.major.x = element_line(color = "grey92"),
+    panel.grid.major.y = element_line(color = "grey95")
+  )
+
+ggsave("C:/Users/a1230/Desktop/picture/flood_effects_forest_plot_corrected.png", flood_forest_plot, 
+       width = 14, height = 8, dpi = 300, bg = "white")
+
+# 如果你希望lag效应从上到下按1,2,3,4排列，使用这个版本：
+flood_forest_plot_alt <- ggplot(flood_vars, aes(x = coef, y = var_label, color = model)) +
+  geom_vline(xintercept = 0, linetype = "solid", color = "grey40", size = 0.5) +
+  geom_point(position = position_dodge(width = 0.6), size = 3, alpha = 0.8) +
+  geom_errorbarh(aes(xmin = ci_low, xmax = ci_high), 
+                 height = 0.15, position = position_dodge(width = 0.6), 
+                 size = 0.7, alpha = 0.8) +
+  geom_text(aes(x = ci_high + 0.015, label = sig), 
+            position = position_dodge(width = 0.6), hjust = 0, size = 4, fontface = "bold") +
+  scale_color_manual(values = nature_colors[1:3]) +
+  # 保持原始顺序：flood event在顶部，然后是lag 1,2,3,4
+  scale_y_discrete(limits = desired_order) +
+  labs(
+    title = "Impact of floods and lag effects on malaria incidence",
+    subtitle = "Coefficient estimates from Poisson fixed-effects models with 95% confidence intervals",
+    x = "Coefficient estimate (95% CI)",
+    y = NULL,
+    color = "Model specification"
+  ) +
+  theme_nature() +
+  theme(
+    legend.position = "bottom",
+    axis.text.y = element_text(hjust = 1),
+    panel.grid.major.x = element_line(color = "grey92"),
+    panel.grid.major.y = element_line(color = "grey95")
+  )
+
+ggsave("C:/Users/a1230/Desktop/picture/flood_effects_forest_plot_alt.png", flood_forest_plot_alt, 
+       width = 14, height = 8, dpi = 300, bg = "white")
+
+cat("修正后的森林图已保存:\n")
+cat("1. flood_effects_forest_plot_corrected.png - lag效应从下到上按1,2,3,4排列\n")
+cat("2. flood_effects_forest_plot_alt.png - lag效应从上到下按1,2,3,4排列\n")

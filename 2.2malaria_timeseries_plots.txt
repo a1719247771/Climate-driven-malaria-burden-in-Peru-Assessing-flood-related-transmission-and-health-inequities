@@ -1,0 +1,360 @@
+# =============================================================================
+# Malaria Incidence Data Time Series Trend Analysis
+# Author: Data Analyst
+# Date: June 2025
+# Function: Aggregate malaria cases by year and month, create time series trend plots
+# =============================================================================
+
+# Clear environment
+rm(list = ls())
+
+# Load necessary packages
+library(readxl)       # Read Excel files
+library(dplyr)        # Data processing
+library(ggplot2)      # Data visualization
+library(lubridate)    # Date processing
+library(gridExtra)    # Combine charts
+library(scales)       # Format labels
+library(RColorBrewer) # Color schemes
+library(viridis)      # Better color schemes
+library(forecast)     # Time series analysis
+library(zoo)          # Time series processing
+library(data.table)   # Efficient data processing
+library(plotly)       # Interactive charts (optional)
+
+# Set font for Windows systems
+if (.Platform$OS.type == "windows") {
+  windowsFonts(myFont = windowsFont("Arial"))
+  par(family = "myFont")
+}
+
+# Create output directory
+output_dir <- "C:/Users/a1230/Desktop/malaria_timeseries_plots"
+dir.create(output_dir, showWarnings = FALSE)
+
+# =============================================================================
+# 1. Data Reading and Preprocessing
+# =============================================================================
+
+cat("\n======= Reading and Preprocessing Malaria Incidence Data =======\n")
+
+# Read data
+data <- read_excel("C:/Users/a1230/Desktop/nuejidata.xlsx")
+
+# Convert to data.table for improved processing efficiency
+setDT(data)
+
+# Check data structure
+cat("Data dimensions:", dim(data), "\n")
+cat("Column names:", colnames(data)[1:10], "...\n")
+cat("Data overview:\n")
+str(data[, 1:10])
+
+# Data preprocessing
+data[, year := as.integer(year)]
+data[, week := as.integer(week)]
+data[, Y := as.numeric(Y)]  # Malaria cases
+
+# Handle missing values
+data[is.na(Y), Y := 0]
+cat("Malaria cases (Y) statistics:\n")
+print(summary(data$Y))
+
+# Create month variable (estimated from week number, assuming 52 weeks per year)
+data[, month := ceiling(week / (52/12))]
+data[month > 12, month := 12]  # Ensure month doesn't exceed 12
+
+# Create season variable
+data[, season := case_when(
+  month %in% c(12, 1, 2) ~ "Winter",
+  month %in% c(3, 4, 5) ~ "Spring", 
+  month %in% c(6, 7, 8) ~ "Summer",
+  month %in% c(9, 10, 11) ~ "Autumn"
+)]
+
+# Create year-month variable for time series
+data[, year_month := as.Date(paste(year, month, "01", sep = "-"))]
+
+cat("Data preprocessing completed!\n")
+cat("Year range:", min(data$year, na.rm = TRUE), "-", max(data$year, na.rm = TRUE), "\n")
+cat("Total cities:", length(unique(data$cityid)), "\n")
+cat("Total records:", nrow(data), "\n")
+
+# =============================================================================
+# 2. Annual Summary Analysis
+# =============================================================================
+
+cat("\n======= Annual Summary Analysis =======\n")
+
+# Annual summary
+yearly_summary <- data %>%
+  group_by(year) %>%
+  summarise(
+    total_cases = sum(Y, na.rm = TRUE),
+    avg_cases_per_week = mean(Y, na.rm = TRUE),
+    cities_count = n_distinct(cityid),
+    avg_temperature = mean(temperature, na.rm = TRUE),
+    total_flood_events = sum(flood, na.rm = TRUE),
+    flood_rate = mean(flood > 0, na.rm = TRUE) * 100,
+    avg_precipitation = mean(total_precipitation_sum, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  arrange(year)
+
+cat("Annual summary statistics:\n")
+print(yearly_summary)
+
+# Calculate annual growth rate
+yearly_summary <- yearly_summary %>%
+  mutate(
+    cases_growth_rate = (total_cases / lag(total_cases) - 1) * 100,
+    cases_change = total_cases - lag(total_cases)
+  )
+
+# =============================================================================
+# 3. Monthly Summary Analysis
+# =============================================================================
+
+cat("\n======= Monthly Summary Analysis =======\n")
+
+# Monthly summary (cross-year aggregation)
+monthly_summary <- data %>%
+  group_by(month) %>%
+  summarise(
+    total_cases = sum(Y, na.rm = TRUE),
+    avg_cases = mean(Y, na.rm = TRUE),
+    median_cases = median(Y, na.rm = TRUE),
+    cases_sd = sd(Y, na.rm = TRUE),
+    avg_temperature = mean(temperature, na.rm = TRUE),
+    total_flood_events = sum(flood, na.rm = TRUE),
+    flood_rate = mean(flood > 0, na.rm = TRUE) * 100,
+    avg_precipitation = mean(total_precipitation_sum, na.rm = TRUE),
+    records_count = n(),
+    .groups = 'drop'
+  ) %>%
+  arrange(month) %>%
+  mutate(
+    month_name = month.abb[month],
+    month_english = c("Jan", "Feb", "Mar", "Apr", "May", "Jun", 
+                      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")[month]
+  )
+
+cat("Monthly summary statistics:\n")
+print(monthly_summary)
+
+# Monthly-yearly combined summary (each month of each year)
+monthly_yearly_summary <- data %>%
+  group_by(year, month) %>%
+  summarise(
+    total_cases = sum(Y, na.rm = TRUE),
+    avg_cases = mean(Y, na.rm = TRUE),
+    avg_temperature = mean(temperature, na.rm = TRUE),
+    flood_events = sum(flood, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    year_month = as.Date(paste(year, month, "01", sep = "-")),
+    month_name = month.abb[month]
+  ) %>%
+  arrange(year, month)
+
+# =============================================================================
+# 4. Create Annual Trend Plots
+# =============================================================================
+
+cat("\n======= Creating Annual Trend Plots =======\n")
+
+# Plot 1: Annual malaria cases trend - Nature色系
+p1 <- ggplot(yearly_summary, aes(x = year)) +
+  geom_line(aes(y = total_cases), color = "#2E8B57", size = 1.5) +
+  geom_point(aes(y = total_cases), color = "#2E8B57", size = 3) +
+  geom_smooth(aes(y = total_cases), method = "loess", se = TRUE, alpha = 0.3, color = "#4682B4") +
+  labs(
+    title = "Annual Malaria Cases Trend",
+    subtitle = paste("Data period:", min(yearly_summary$year), "-", max(yearly_summary$year)),
+    x = "Year",
+    y = "Total Malaria Cases"
+  ) +
+  scale_y_continuous(labels = scales::comma) +
+  scale_x_continuous(breaks = pretty_breaks(n = 8)) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 14),
+    axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    panel.grid.minor = element_blank()
+  )
+
+# Plot 3: Annual growth rate - Nature色系
+p3 <- ggplot(yearly_summary[-1, ], aes(x = year, y = cases_growth_rate)) +
+  geom_col(aes(fill = cases_growth_rate > 0), alpha = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#8B4513") +
+  scale_fill_manual(values = c("TRUE" = "#228B22", "FALSE" = "#D2691E"), 
+                    labels = c("TRUE" = "Positive growth", "FALSE" = "Negative growth"),
+                    name = "",
+                    guide = guide_legend(override.aes = list(alpha = 1))) +
+  labs(
+    title = "Annual Malaria Cases Growth Rate",
+    x = "Year",
+    y = "Growth Rate (%)"
+  ) +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 14),
+    axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    legend.position = "bottom",
+    legend.key.width = unit(1.5, "cm"),
+    legend.text = element_text(size = 12)
+  )
+
+# =============================================================================
+# 5. Create Monthly Trend Plots
+# =============================================================================
+
+cat("\n======= Creating Monthly Trend Plots =======\n")
+
+# 创建nature风格的渐变色板 - 海洋蓝到森林绿
+nature_colors <- colorRampPalette(c("#4682B4", "#5F9EA0", "#20B2AA", "#3CB371", "#228B22", "#2E8B57"))(12)
+
+# Plot 4: Monthly malaria cases distribution (bar chart) - Nature色系
+p4 <- ggplot(monthly_summary, aes(x = factor(month), y = total_cases)) +
+  geom_col(aes(fill = total_cases), alpha = 0.85) +
+  scale_fill_gradientn(colors = nature_colors, name = "Cases",
+                       guide = guide_colorbar(barwidth = 15, barheight = 1,
+                                              title.position = "top", title.hjust = 0.5)) +
+  labs(
+    title = "Monthly Malaria Cases Distribution",
+    subtitle = "Monthly aggregation based on all years data",
+    x = "Month",
+    y = "Total Cases"
+  ) +
+  scale_x_discrete(labels = monthly_summary$month_english) +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 14),
+    axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom",
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 14)
+  )
+
+# Plot 5: Monthly average cases trend line - Nature色系
+p5 <- ggplot(monthly_summary, aes(x = month, y = avg_cases)) +
+  geom_line(color = "#2E8B57", size = 1.5) +
+  geom_point(color = "#2E8B57", size = 3) +
+  geom_smooth(method = "loess", se = TRUE, alpha = 0.3, color = "#4682B4") +
+  labs(
+    title = "Monthly Average Malaria Cases Trend",
+    subtitle = "Shows seasonal patterns",
+    x = "Month",
+    y = "Average Cases"
+  ) +
+  scale_x_continuous(breaks = 1:12, labels = monthly_summary$month_english) +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 14),
+    axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+# =============================================================================
+# 6. Save Charts - Only Two Combined Plots
+# =============================================================================
+
+cat("\n======= Saving Charts =======\n")
+
+# Create combined charts - only these two will be saved
+combined_yearly <- grid.arrange(p1, p3, ncol = 1, top = "Annual Malaria Cases Trend Analysis")
+combined_monthly <- grid.arrange(p4, p5, ncol = 1, top = "Monthly Malaria Cases Trend Analysis")
+
+ggsave(file.path(output_dir, "annual_malaria_analysis.png"), combined_yearly, width = 14, height = 12, dpi = 300)
+ggsave(file.path(output_dir, "monthly_malaria_analysis.png"), combined_monthly, width = 14, height = 12, dpi = 300)
+
+# =============================================================================
+# 7. Save Summary Statistics Results
+# =============================================================================
+
+cat("\n======= Saving Summary Statistics Results =======\n")
+
+# Save summary data as Excel file
+library(writexl)
+
+summary_data <- list(
+  "Annual_Summary" = yearly_summary,
+  "Monthly_Summary" = monthly_summary,
+  "Monthly_Yearly_Summary" = monthly_yearly_summary
+)
+
+write_xlsx(summary_data, file.path(output_dir, "malaria_timeseries_summary.xlsx"))
+
+# Save as CSV files
+write.csv(yearly_summary, file.path(output_dir, "yearly_summary.csv"), row.names = FALSE)
+write.csv(monthly_summary, file.path(output_dir, "monthly_summary.csv"), row.names = FALSE)
+
+# =============================================================================
+# 8. Generate Analysis Report
+# =============================================================================
+
+cat("\n======= Generating Analysis Report =======\n")
+
+# Calculate key statistical indicators
+total_cases_all_years <- sum(yearly_summary$total_cases, na.rm = TRUE)
+peak_year <- yearly_summary$year[which.max(yearly_summary$total_cases)]
+peak_month <- monthly_summary$month[which.max(monthly_summary$total_cases)]
+
+# Generate text report
+report <- paste0(
+  "Malaria Incidence Time Series Analysis Report\n",
+  "=============================================\n\n",
+  "Data Overview:\n",
+  "- Analysis period: ", min(yearly_summary$year), " - ", max(yearly_summary$year), "\n",
+  "- Total cases: ", format(total_cases_all_years, big.mark = ","), "\n",
+  "- Average annual cases: ", format(round(total_cases_all_years / nrow(yearly_summary)), big.mark = ","), "\n",
+  "- Number of cities analyzed: ", length(unique(data$cityid)), "\n\n",
+  
+  "Key Findings:\n",
+  "- Peak year: ", peak_year, " (", format(max(yearly_summary$total_cases), big.mark = ","), " cases)\n",
+  "- Peak month: ", peak_month, " (", monthly_summary$month_english[peak_month], ")\n\n",
+  
+  "Trend Characteristics:\n",
+  if (nrow(yearly_summary) > 1) {
+    paste0("- Recent trend: ", 
+           ifelse(yearly_summary$cases_growth_rate[nrow(yearly_summary)] > 0, "Increasing", "Decreasing"),
+           " (", round(yearly_summary$cases_growth_rate[nrow(yearly_summary)], 1), "%)\n")
+  } else "",
+  
+  "Generated Files:\n",
+  "1. Annual malaria cases trend analysis\n",
+  "2. Monthly malaria cases trend analysis\n",
+  "3. Summary statistics tables\n\n",
+  
+  "Files saved to: ", output_dir, "\n"
+)
+
+# Save report
+writeLines(report, file.path(output_dir, "analysis_report.txt"))
+
+# Console output report
+cat(report)
+
+cat("\n======= Malaria Time Series Analysis Completed! =======\n")
+cat("Only two combined charts have been saved to:", output_dir, "\n")
+cat("Please check the generated charts to understand the temporal trends and seasonal patterns of malaria incidence.\n")

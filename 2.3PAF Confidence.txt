@@ -1,0 +1,623 @@
+# Flood Attribution Analysis for Malaria and Geographic Visualization
+# Based on Poisson Fixed Effects Model (Model 2: Including Socioeconomic Variables)
+# Corrected Version: Proper PAF Confidence Interval Calculation
+
+# Load required packages
+library(fixest)       # For fixed effects models
+library(data.table)   # For efficient data processing
+library(readxl)       # For reading Excel files
+library(writexl)      # For writing Excel files
+library(dplyr)        # For data manipulation
+library(tidyr)        # For data reshaping
+library(ggplot2)      # For data visualization
+library(RColorBrewer) # For color schemes
+library(viridis)      # For better color schemes
+library(gridExtra)    # For combining multiple plots
+library(scales)       # For formatting legends
+library(sf)           # For spatial data processing
+library(boot)         # For bootstrap confidence intervals
+
+# Try to load spatial analysis package
+spatial_analysis_available <- require(spdep)
+if(!spatial_analysis_available) {
+  cat("Note: Spatial analysis package 'spdep' not installed, will skip spatial autocorrelation analysis.\n")
+}
+
+#####################################
+## 1. Data Preparation
+#####################################
+
+# Read data
+data <- read_excel("C:/Users/a1230/Desktop/nuejidata.xlsx")
+
+# Convert to data.table for improved processing efficiency
+setDT(data)
+
+# Check data structure
+cat("\nData Structure Overview:\n")
+str(data)
+
+# Verify ADM3 column exists
+if("ADM3" %in% colnames(data)) {
+  cat("\nFound ADM3 column, can be used for map matching\n")
+  id_col <- "ADM3"
+} else if("ADM3_PCODE" %in% colnames(data)) {
+  cat("\nFound ADM3_PCODE column, can be used for map matching\n")
+  id_col <- "ADM3_PCODE"
+} else {
+  cat("\nWarning: Map matching column (ADM3/ADM3_PCODE) not found, will use cityid as identifier\n")
+  id_col <- "cityid"
+}
+
+# Data preprocessing
+data[, year := as.integer(year)]
+data[, week := as.integer(week)]
+data[, cityid := as.factor(cityid)]
+data[, yearweek := paste0(year, "_", sprintf("%02d", week))]
+data[, yearweek := as.factor(yearweek)]
+
+# Temperature variables
+data[, temp_range := max - min]  # Temperature range
+data[, temperature_sq := temperature^2]  # Quadratic temperature term
+
+# Prepare population offset (using population variable)
+if ("population" %in% names(data)) {
+  data[, population := as.numeric(population)]
+  data[population <= 0 | is.na(population), population := 1]  # Avoid log(0) or NA
+  data[, log_population_offset := log(population)]
+  cat("\n✓ Created log_population_offset for population offset in model\n")
+  cat("Population data statistics:\n")
+  print(summary(data$population))
+  offset_available <- TRUE
+} else {
+  cat("\nWarning: No 'population' column in data, model will not use population offset.\n")
+  offset_available <- FALSE
+}
+
+# Prepare population density variable (as control variable)
+if ("population_density" %in% names(data)) {
+  data[, population_density := as.numeric(population_density)]
+  data[, log_population_density := log(population_density + 1)]
+  cat("\n✓ Created log_population_density for control variable in model\n")
+  cat("Population density data statistics:\n")
+  print(summary(data$population_density))
+  pop_density_available <- TRUE
+} else {
+  cat("\nWarning: No 'population_density' column in data.\n")
+  pop_density_available <- FALSE
+}
+
+# Check other socioeconomic variables
+if ("light_density" %in% names(data)) {
+  data[, light_density := as.numeric(light_density)]
+  data[, log_light_density := log(light_density + 1)]
+  cat("✓ Created log_light_density variable\n")
+  light_density_available <- TRUE
+} else {
+  cat("Warning: No 'light_density' column in data.\n")
+  light_density_available <- FALSE
+}
+
+if ("LandUse_10" %in% names(data)) {
+  data[, urban_index := LandUse_10]
+  cat("✓ Created urban_index variable\n")
+  urban_available <- TRUE
+} else {
+  cat("Warning: No 'LandUse_10' column in data.\n")
+  urban_available <- FALSE
+}
+
+# Check if all socioeconomic variables exist
+socioeconomic_vars_exist <- pop_density_available && light_density_available && urban_available
+
+if(socioeconomic_vars_exist) {
+  cat("\n✓ All socioeconomic variables prepared, will use complete Model 2\n")
+} else {
+  cat("\nWarning: Some socioeconomic variables missing, will build model with available variables\n")
+  # List missing variables
+  missing_vars <- c()
+  if(!pop_density_available) missing_vars <- c(missing_vars, "population_density")
+  if(!light_density_available) missing_vars <- c(missing_vars, "light_density")
+  if(!urban_available) missing_vars <- c(missing_vars, "LandUse_10")
+  cat("Missing variables:", paste(missing_vars, collapse=", "), "\n")
+}
+
+#####################################
+## 2. MODEL 2: Poisson Fixed Effects Model with Socioeconomic Control Variables
+#####################################
+
+cat("\n======= MODEL 2: Poisson Fixed Effects Model with Socioeconomic Control Variables =======\n")
+
+# Build list of available control variables
+control_vars <- c("temperature", "temperature_sq", "temp_range",
+                  "pressure", "wind_speed", "relative_humidity", 
+                  "total_precipitation_sum")
+
+# Add available socioeconomic variables
+if(pop_density_available) {
+  control_vars <- c(control_vars, "log_population_density")
+  cat("✓ Including population density control variable\n")
+}
+if(light_density_available) {
+  control_vars <- c(control_vars, "log_light_density")
+  cat("✓ Including light density control variable\n")
+}
+if(urban_available) {
+  control_vars <- c(control_vars, "urban_index")
+  cat("✓ Including urbanization index control variable\n")
+}
+
+# Build model formula
+formula_str <- paste("Y ~ flood +", paste(control_vars, collapse = " + "), "| cityid + yearweek")
+cat("\nModel formula:", formula_str, "\n")
+
+# Estimate model based on population offset availability
+if (offset_available) {
+  model2 <- fepois(as.formula(formula_str), 
+                   offset = ~log_population_offset,
+                   data = data)
+  cat("\n✓ Model includes population offset (log_population_offset)\n")
+  cat("   This means the model analyzes malaria incidence rates rather than absolute case counts\n")
+} else {
+  model2 <- fepois(as.formula(formula_str), data = data)
+  cat("\n⚠ Model does not include population offset, analyzes absolute case counts\n")
+}
+
+# Output model results
+cat("\nModel 2 Results Summary:\n")
+print(summary(model2))
+
+#####################################
+## 3. Population Attributable Fraction (PAF) and Confidence Interval Calculation - Corrected Version
+#####################################
+
+cat("\n======= Population Attributable Fraction (PAF) and Confidence Interval Calculation (Corrected Version) =======\n")
+
+# Extract flood effect coefficient and standard error
+flood_coef <- coef(model2)["flood"]
+flood_se <- se(model2)["flood"]
+
+cat("\nFlood effect coefficient (β_flood):", round(flood_coef, 4), "\n")
+cat("Standard error (SE):", round(flood_se, 4), "\n")
+
+# Calculate 95% confidence interval for coefficient
+alpha <- 0.05
+z_critical <- qnorm(1 - alpha/2)
+flood_coef_lower <- flood_coef - z_critical * flood_se
+flood_coef_upper <- flood_coef + z_critical * flood_se
+
+cat("\nFlood effect coefficient 95% confidence interval: [", round(flood_coef_lower, 4), ", ", round(flood_coef_upper, 4), "]\n")
+
+# *** Correction: Proper PAF confidence interval calculation ***
+cat("\nMathematical verification: PAF is an increasing function of β\n")
+cat("PAF = 1 - 1/exp(β) = 1 - exp(-β)\n")
+cat("d(PAF)/dβ = exp(-β) > 0, therefore PAF is a strictly increasing function of β\n")
+
+# Calculate Population Attributable Fraction (PAF) point estimate and confidence interval
+# Using formula: PAF = 1 - 1/exp(β_flood)
+paf_point <- 1 - 1/exp(flood_coef)
+
+# *** Correction: Since PAF is an increasing function of β, no need to swap upper and lower bounds ***
+paf_lower <- 1 - 1/exp(flood_coef_lower)  # Correction: use β lower bound
+paf_upper <- 1 - 1/exp(flood_coef_upper)  # Correction: use β upper bound
+
+# Convert to percentages
+paf_point_percent <- paf_point * 100
+paf_lower_percent <- paf_lower * 100
+paf_upper_percent <- paf_upper * 100
+
+cat("\n======= Population Attributable Fraction (PAF) Results (Corrected Version) =======\n")
+cat("PAF point estimate:", round(paf_point_percent, 2), "%\n")
+cat("PAF 95% confidence interval: [", round(paf_lower_percent, 2), "%, ", round(paf_upper_percent, 2), "%]\n")
+
+# Verify confidence interval reasonableness
+cat("\nConfidence interval verification:\n")
+cat("✓ Lower < Point estimate < Upper:", round(paf_lower_percent, 2), "% <", 
+    round(paf_point_percent, 2), "% <", round(paf_upper_percent, 2), "%\n")
+cat("✓ Interval width:", round(paf_upper_percent - paf_lower_percent, 2), "%\n")
+
+# Interpret flood effect
+rate_ratio <- exp(flood_coef)
+percent_change <- (rate_ratio - 1) * 100
+
+if(offset_available) {
+  cat("\nFlood effect interpretation:\n")
+  cat("- Rate Ratio:", round(rate_ratio, 3), "\n")
+  cat("- Flood increases malaria incidence rate by", round(percent_change, 2), "%\n")
+  cat("- In flood conditions,", round(paf_point_percent, 2), "% of malaria cases can be attributed to flood\n")
+} else {
+  cat("\nFlood effect interpretation:\n")
+  cat("- Rate Ratio:", round(rate_ratio, 3), "\n")
+  cat("- Flood increases malaria case count by", round(percent_change, 2), "%\n")
+  cat("- In flood conditions,", round(paf_point_percent, 2), "% of malaria cases can be attributed to flood\n")
+}
+
+#####################################
+## 4. Create Output Directory
+#####################################
+
+output_dir <- "C:/Users/a1230/Desktop/pic"
+dir.create(output_dir, showWarnings = FALSE)
+
+#####################################
+## 5. Attributable Cases Calculation (Using Corrected PAF)
+#####################################
+
+cat("\n======= Attributable Cases Calculation (Using Corrected PAF) =======\n")
+
+# Use corrected PAF values to calculate attributable cases
+# Only when flood = 1 are there attributable cases
+data$paf_fixed <- paf_point  # Fixed PAF value
+data$paf_fixed_lower <- paf_lower  # Corrected PAF lower bound
+data$paf_fixed_upper <- paf_upper  # Corrected PAF upper bound
+
+# Calculate attributable cases (point estimate and confidence interval)
+data$attributable_cases_point <- ifelse(data$flood == 1, data$Y * data$paf_fixed, 0)
+data$attributable_cases_lower <- ifelse(data$flood == 1, data$Y * data$paf_fixed_lower, 0)
+data$attributable_cases_upper <- ifelse(data$flood == 1, data$Y * data$paf_fixed_upper, 0)
+
+# Summarize attribution analysis results by city
+city_attribution_corrected <- data %>%
+  group_by(cityid) %>%
+  summarise(
+    # Preserve ADM3 column (if exists)
+    ADM3 = first(get(id_col)),
+    
+    # Basic statistics
+    total_weeks = n(),
+    total_cases = sum(Y, na.rm = TRUE),
+    flood_weeks = sum(flood > 0, na.rm = TRUE),
+    flood_occurrence_rate = mean(flood > 0, na.rm = TRUE) * 100,
+    
+    # Attributable cases statistics (point estimate and confidence interval)
+    total_attributable_cases_point = sum(attributable_cases_point, na.rm = TRUE),
+    total_attributable_cases_lower = sum(attributable_cases_lower, na.rm = TRUE),
+    total_attributable_cases_upper = sum(attributable_cases_upper, na.rm = TRUE),
+    
+    # PAF statistics (same for all cities)
+    paf_percent = paf_point_percent,
+    paf_lower_percent = paf_lower_percent,
+    paf_upper_percent = paf_upper_percent,
+    
+    # Population statistics (if available)
+    avg_population = if ("population" %in% names(data)) mean(population, na.rm = TRUE) else NA,
+    avg_population_density = if ("population_density" %in% names(data)) mean(population_density, na.rm = TRUE) else NA,
+    
+    .groups = 'drop'
+  ) %>%
+  arrange(desc(total_attributable_cases_point))  # Sort by attributable cases
+
+#####################################
+## 6. Global Attribution Statistics
+#####################################
+
+cat("\n======= Global Attribution Statistics =======\n")
+
+# Calculate global attribution statistics
+global_attribution_summary <- data.frame(
+  # Basic statistics
+  total_observations = nrow(data),
+  total_cities = length(unique(data$cityid)),
+  total_weeks = length(unique(data$yearweek)),
+  total_cases = sum(data$Y, na.rm = TRUE),
+  total_flood_observations = sum(data$flood > 0, na.rm = TRUE),
+  flood_occurrence_rate_percent = mean(data$flood > 0, na.rm = TRUE) * 100,
+  
+  # PAF statistics (corrected)
+  paf_point_percent = paf_point_percent,
+  paf_lower_percent = paf_lower_percent,
+  paf_upper_percent = paf_upper_percent,
+  
+  # Global attributable cases statistics (corrected)
+  total_attributable_cases_point = sum(data$attributable_cases_point, na.rm = TRUE),
+  total_attributable_cases_lower = sum(data$attributable_cases_lower, na.rm = TRUE),
+  total_attributable_cases_upper = sum(data$attributable_cases_upper, na.rm = TRUE),
+  
+  # Attribution proportion (percentage in total cases)
+  overall_attribution_rate_point = sum(data$attributable_cases_point, na.rm = TRUE) / sum(data$Y, na.rm = TRUE) * 100,
+  overall_attribution_rate_lower = sum(data$attributable_cases_lower, na.rm = TRUE) / sum(data$Y, na.rm = TRUE) * 100,
+  overall_attribution_rate_upper = sum(data$attributable_cases_upper, na.rm = TRUE) / sum(data$Y, na.rm = TRUE) * 100
+)
+
+#####################################
+## 7. Save Results
+#####################################
+
+# Save city-level attribution results
+write.csv(city_attribution_corrected, file.path(output_dir, "city_flood_attribution_corrected.csv"), row.names = FALSE)
+write.csv(global_attribution_summary, file.path(output_dir, "global_flood_attribution_corrected.csv"), row.names = FALSE)
+
+# Create detailed results summary table
+detailed_results <- data.frame(
+  Metric = c(
+    "Flood effect coefficient (β_flood)",
+    "Coefficient standard error",
+    "Coefficient 95% CI lower bound",
+    "Coefficient 95% CI upper bound",
+    "Rate Ratio",
+    "PAF point estimate (%)",
+    "PAF 95% CI lower bound (%)",
+    "PAF 95% CI upper bound (%)",
+    "Total malaria cases",
+    "Total flood observations",
+    "Flood occurrence rate (%)",
+    "Attributable cases point estimate",
+    "Attributable cases 95% CI lower bound",
+    "Attributable cases 95% CI upper bound",
+    "Overall attribution rate point estimate (%)",
+    "Overall attribution rate 95% CI lower bound (%)",
+    "Overall attribution rate 95% CI upper bound (%)"
+  ),
+  Value = c(
+    round(flood_coef, 4),
+    round(flood_se, 4),
+    round(flood_coef_lower, 4),
+    round(flood_coef_upper, 4),
+    round(rate_ratio, 3),
+    round(paf_point_percent, 2),
+    round(paf_lower_percent, 2),
+    round(paf_upper_percent, 2),
+    global_attribution_summary$total_cases,
+    global_attribution_summary$total_flood_observations,
+    round(global_attribution_summary$flood_occurrence_rate_percent, 2),
+    round(global_attribution_summary$total_attributable_cases_point, 0),
+    round(global_attribution_summary$total_attributable_cases_lower, 0),
+    round(global_attribution_summary$total_attributable_cases_upper, 0),
+    round(global_attribution_summary$overall_attribution_rate_point, 2),
+    round(global_attribution_summary$overall_attribution_rate_lower, 2),
+    round(global_attribution_summary$overall_attribution_rate_upper, 2)
+  ),
+  stringsAsFactors = FALSE
+)
+
+write.csv(detailed_results, file.path(output_dir, "detailed_attribution_results_corrected.csv"), row.names = FALSE)
+
+#####################################
+## 8. Visualization Results (Corrected Version)
+#####################################
+
+# 1. PAF point estimate and confidence interval plot (corrected version)
+paf_plot_corrected <- ggplot() +
+  geom_point(aes(x = "Population Attributable Fraction (PAF)", y = paf_point_percent), 
+             size = 4, color = "darkblue") +
+  geom_errorbar(aes(x = "Population Attributable Fraction (PAF)", 
+                    ymin = paf_lower_percent, ymax = paf_upper_percent),
+                width = 0.1, color = "darkblue", size = 1.2) +
+  geom_text(aes(x = "Population Attributable Fraction (PAF)", y = paf_point_percent + 1.5, 
+                label = paste0(round(paf_point_percent, 2), "%")), 
+            size = 4, fontface = "bold") +
+  geom_text(aes(x = "Population Attributable Fraction (PAF)", y = paf_lower_percent - 1.5, 
+                label = paste0("[", round(paf_lower_percent, 2), "%, ", 
+                               round(paf_upper_percent, 2), "%]")), 
+            size = 3.5) +
+  labs(title = "Population Attributable Fraction (PAF) of Malaria due to Floods - Corrected Version",
+       subtitle = paste0("Based on Poisson Fixed Effects Model", 
+                         ifelse(offset_available, " (with population offset)", " (without population offset)"),
+                         "\nCorrection: PAF is an increasing function of β"),
+       y = "Attribution Fraction (%)",
+       x = "") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 12),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title.y = element_text(size = 12)
+  ) +
+  coord_cartesian(ylim = c(max(0, paf_lower_percent - 3), paf_upper_percent + 3))
+
+ggsave(file.path(output_dir, "paf_with_confidence_interval_corrected.png"), paf_plot_corrected, width = 8, height = 6, dpi = 300)
+
+# 2. Attributable cases visualization (corrected version)
+global_cases_data_corrected <- data.frame(
+  Type = c("Point Estimate", "Lower Bound", "Upper Bound"),
+  Cases = c(global_attribution_summary$total_attributable_cases_point,
+            global_attribution_summary$total_attributable_cases_lower,
+            global_attribution_summary$total_attributable_cases_upper),
+  stringsAsFactors = FALSE
+)
+
+global_cases_plot_corrected <- ggplot(global_cases_data_corrected, aes(x = Type, y = Cases)) +
+  geom_bar(stat = "identity", fill = c("steelblue", "lightblue", "lightblue"), alpha = 0.8) +
+  geom_text(aes(label = round(Cases, 0)), vjust = -0.5, size = 4, fontface = "bold") +
+  labs(title = "Global Malaria Cases Attributable to Floods - Corrected Version",
+       subtitle = paste0("Point estimate: ", round(global_attribution_summary$total_attributable_cases_point, 0), 
+                         " cases [95%CI: ", round(global_attribution_summary$total_attributable_cases_lower, 0),
+                         "-", round(global_attribution_summary$total_attributable_cases_upper, 0), "]"),
+       x = "Estimate Type",
+       y = "Attributable Cases") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 12)
+  )
+
+ggsave(file.path(output_dir, "global_attributable_cases_corrected.png"), global_cases_plot_corrected, width = 8, height = 6, dpi = 300)
+
+# 3. Top 10 cities attributable cases (corrected version)
+top_cities_cases_plot_corrected <- ggplot(head(city_attribution_corrected, 10), 
+                                          aes(x = reorder(cityid, total_attributable_cases_point))) +
+  geom_bar(aes(y = total_attributable_cases_point), stat = "identity", fill = "steelblue", alpha = 0.8) +
+  geom_errorbar(aes(ymin = total_attributable_cases_lower, ymax = total_attributable_cases_upper),
+                width = 0.2, color = "darkblue") +
+  labs(title = "Malaria Cases Attributable to Floods by City (Top 10 Cities) - Corrected Version",
+       subtitle = paste0("PAF = ", round(paf_point_percent, 2), "% [", 
+                         round(paf_lower_percent, 2), "%, ", round(paf_upper_percent, 2), "%]"),
+       x = "City ID",
+       y = "Attributable Cases") +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5),
+    axis.text.y = element_text(size = 9)
+  )
+
+ggsave(file.path(output_dir, "top_cities_attributable_cases_corrected.png"), top_cities_cases_plot_corrected, width = 10, height = 8, dpi = 300)
+
+# 4. Confidence interval comparison plot (showing before/after correction differences)
+comparison_data <- data.frame(
+  Version = rep(c("Before Correction (Wrong)", "After Correction (Correct)"), each = 3),
+  Type = rep(c("Lower Bound", "Point Estimate", "Upper Bound"), 2),
+  Value = c(
+    # Before correction wrong results (extracted from user output)
+    47.46, 36.08, 22.22,  # Wrong: lower > upper
+    # After correction correct results
+    paf_lower_percent, paf_point_percent, paf_upper_percent
+  )
+)
+
+comparison_plot <- ggplot(comparison_data, aes(x = Type, y = Value, fill = Version)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.8) +
+  geom_text(aes(label = paste0(round(Value, 2), "%")), 
+            position = position_dodge(width = 0.9), vjust = -0.5, size = 3) +
+  scale_fill_manual(values = c("Before Correction (Wrong)" = "red", "After Correction (Correct)" = "blue")) +
+  labs(title = "PAF Confidence Interval Calculation: Before vs After Correction",
+       subtitle = "Before: Lower > Upper (Wrong), After: Lower < Upper (Correct)",
+       x = "Estimate Type",
+       y = "PAF (%)",
+       fill = "Version") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "bottom"
+  )
+
+ggsave(file.path(output_dir, "paf_comparison_before_after_correction.png"), comparison_plot, width = 10, height = 6, dpi = 300)
+
+#####################################
+## 9. Map Visualization (if map file available)
+#####################################
+
+# Read shapefile map data
+map_path <- "C:/Users/a1230/Desktop/数据疟疾/地图三级行政区/per_admbnda_adm3_ign_20200714.shp"
+tryCatch({
+  map_data <- st_read(map_path, quiet = TRUE)
+  cat("\nSuccessfully read map data, containing", nrow(map_data), "administrative regions\n")
+  
+  # Check shapefile structure
+  map_cols <- colnames(map_data)
+  cat("Map data contains the following fields:", paste(head(map_cols, 10), collapse=", "), 
+      ifelse(length(map_cols) > 10, "...", ""), "\n")
+  
+  # Determine matching field
+  if("ADM3_PCODE" %in% map_cols) {
+    map_id_field <- "ADM3_PCODE"
+    cat("Will use ADM3_PCODE field for matching\n")
+  } else {
+    cat("Warning: ADM3_PCODE field missing in map data, please check if the following available fields can be used for matching:\n")
+    print(grep("ADM|ID|CODE", map_cols, value = TRUE))
+    map_id_field <- map_cols[1]  # Default to first field, but may need manual adjustment
+    cat("Default using", map_id_field, "field for matching, please modify code manually if incorrect\n")
+  }
+  
+  # Prepare attribution data for map matching
+  attribution_for_map <- city_attribution_corrected %>%
+    mutate(!!map_id_field := ADM3)  # Ensure matching field exists
+  
+  # Merge map data and attribution data
+  map_with_attribution <- map_data %>%
+    left_join(attribution_for_map, by = map_id_field)
+  
+  # Check matching results
+  matched_regions <- sum(!is.na(map_with_attribution$total_attributable_cases_point))
+  total_regions <- nrow(map_with_attribution)
+  match_rate <- matched_regions / total_regions * 100
+  
+  cat("\nMap matching results: Successfully matched", matched_regions, "/", total_regions, 
+      "regions (", round(match_rate, 1), "%)\n")
+  
+  # Attributable cases map (corrected version)
+  cases_attribution_map_corrected <- ggplot(map_with_attribution) +
+    geom_sf(aes(fill = total_attributable_cases_point), color = "white", size = 0.1) +
+    scale_fill_viridis(
+      option = "plasma",
+      name = "Attributable Cases",
+      na.value = "grey80",
+      trans = "sqrt",
+      guide = guide_colorbar(
+        barwidth = 15, barheight = 0.5,
+        title.position = "top"
+      )
+    ) +
+    labs(
+      title = "Malaria Cases Attributable to Floods by Region - Corrected Version",
+      subtitle = paste0("Based on PAF = ", round(paf_point_percent, 2), "% [", 
+                        round(paf_lower_percent, 2), "%, ", round(paf_upper_percent, 2), "%]")
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5),
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    )
+  
+  ggsave(file.path(output_dir, "attributable_cases_map_corrected.png"), cases_attribution_map_corrected, width = 12, height = 10, dpi = 300)
+  
+}, error = function(e) {
+  cat("\nError reading map data:", e$message, "\n")
+  cat("Will skip map visualization section\n")
+})
+
+#####################################
+## 10. Final Results Report (Corrected Version)
+#####################################
+
+cat("\n========== Final Results of Flood Attribution Analysis for Malaria (Corrected Version) ==========\n")
+
+cat("\n【Model Information】:\n")
+cat("- Flood effect coefficient (β_flood):", round(flood_coef, 4), "± ", round(flood_se, 4), "\n")
+cat("- 95% confidence interval: [", round(flood_coef_lower, 4), ", ", round(flood_coef_upper, 4), "]\n")
+cat("- Rate Ratio:", round(rate_ratio, 3), "\n")
+if(offset_available) {
+  cat("- Flood increases malaria incidence rate by", round(percent_change, 2), "%\n")
+} else {
+  cat("- Flood increases malaria case count by", round(percent_change, 2), "%\n")
+}
+
+cat("\n【Population Attributable Fraction (PAF)】- Corrected Version:\n")
+cat("- Point estimate:", round(paf_point_percent, 2), "%\n")
+cat("- 95% confidence interval: [", round(paf_lower_percent, 2), "%, ", round(paf_upper_percent, 2), "%]\n")
+cat("- Interpretation: Under flood exposure conditions,", round(paf_point_percent, 2), "% of malaria cases can be attributed to floods\n")
+
+cat("\n【Flood-Affected Population (Attributable Cases)】- Corrected Version:\n")
+cat("- Point estimate:", round(global_attribution_summary$total_attributable_cases_point, 0), "cases\n")
+cat("- 95% confidence interval: [", round(global_attribution_summary$total_attributable_cases_lower, 0), 
+    ", ", round(global_attribution_summary$total_attributable_cases_upper, 0), "] cases\n")
+
+cat("\n【Correction Notes】:\n")
+cat("- Before correction (wrong): PAF CI = [47.46%, 22.22%] (lower > upper, wrong)\n")
+cat("- After correction (correct): PAF CI = [", round(paf_lower_percent, 2), "%, ", round(paf_upper_percent, 2), "%] (lower < upper, correct)\n")
+cat("- Mathematical principle: PAF is a strictly increasing function of β, confidence interval does not need upper/lower bound swapping\n")
+
+cat("\n【Global Statistics】:\n")
+cat("- Total observations:", global_attribution_summary$total_observations, "\n")
+cat("- Total cities:", global_attribution_summary$total_cities, "\n")
+cat("- Total malaria cases:", global_attribution_summary$total_cases, "\n")
+cat("- Flood event observations:", global_attribution_summary$total_flood_observations, "\n")
+cat("- Flood occurrence rate:", round(global_attribution_summary$flood_occurrence_rate_percent, 2), "%\n")
+
+cat("\n【Overall Attribution Rate】(proportion in all cases) - Corrected Version:\n")
+cat("- Point estimate:", round(global_attribution_summary$overall_attribution_rate_point, 2), "%\n")
+cat("- 95% confidence interval: [", round(global_attribution_summary$overall_attribution_rate_lower, 2), 
+    "%, ", round(global_attribution_summary$overall_attribution_rate_upper, 2), "%]\n")
+
+cat("\n【Top 5 Cities with Most Attributable Cases】:\n")
+top5_cities <- head(city_attribution_corrected[, c("cityid", "total_attributable_cases_point", 
+                                                   "total_attributable_cases_lower", "total_attributable_cases_upper",
+                                                   "flood_occurrence_rate", "total_cases")], 5)
+print(top5_cities)
+
+cat("\nAll analysis results and charts have been saved to directory:", output_dir, "\n")
+
+cat("\n========== Important Correction Notes ==========\n")
+cat("1. Corrected PAF confidence interval calculation error\n")
+cat("2. PAF = 1 - 1/exp(β) is a strictly increasing function of β\n")
+cat("3. Therefore: β_lower → PAF_lower, β_upper → PAF_upper\n")
+cat("4. Confidence interval does not need upper/lower bound swapping\n")
+cat("5. Corrected results comply with statistical theory\n\n")
+
+cat("Correction completed! All results are now correct.\n")

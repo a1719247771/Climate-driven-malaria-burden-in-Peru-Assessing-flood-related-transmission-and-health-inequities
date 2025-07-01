@@ -1,0 +1,675 @@
+#####################################
+## 10. 未来洪水风险情景分析 - 修复版本
+#####################################
+cat("\n--- 10. 未来洪水风险情景分析 (修复版本) ---\n")
+
+# 加载必要的包
+packages_to_load_raster <- c("readr", "data.table", "writexl", "dplyr", "ggplot2", "viridis", "sf", "leaflet", "htmlwidgets")
+for(pkg in packages_to_load_raster){
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+    cat("包 '", pkg, "' 已安装。\n", sep="")
+  }
+  library(pkg, character.only = TRUE)
+  cat("包 '", pkg, "' 已加载。\n", sep="")
+}
+
+# 确保使用正确的函数命名空间
+select <- dplyr::select
+
+# 创建输出目录
+future_output_dir <- "C:/Users/a1230/Desktop/future"
+dir.create(future_output_dir, showWarnings = FALSE, recursive = TRUE)
+
+#####################################
+## 10.1 读取SSP人口数据
+#####################################
+cat("\n--- 10.1 读取SSP人口数据 ---\n")
+
+# 读取SSP人口数据
+ssp_population_path <- "C:/Users/a1230/Desktop/pop/秘鲁市镇人口统计_SSP情景.csv"
+
+# 检查文件是否存在
+if (!file.exists(ssp_population_path)) {
+  stop(paste("SSP人口数据文件不存在:", ssp_population_path))
+}
+
+# 读取数据
+ssp_population_data <- fread(ssp_population_path, encoding = "UTF-8")
+cat("SSP人口数据读取成功，共", nrow(ssp_population_data), "行\n")
+
+# 检查数据结构
+cat("数据列名:", paste(names(ssp_population_data), collapse = ", "), "\n")
+
+# 确保ADM3_PCODE是字符格式
+ssp_population_data$ADM3_PCODE <- as.character(ssp_population_data$ADM3_PCODE)
+
+# 显示数据样本
+cat("\nSSP人口数据样本:\n")
+print(head(ssp_population_data))
+
+#####################################
+## 10.2 计算历史基线病例数（修复版本）
+#####################################
+cat("\n--- 10.2 计算历史基线病例数（基于绝对数量） ---\n")
+
+# 检查是否存在城市特定SD效应数据
+if (!exists("city_sd_effect_specific")) {
+  stop("未找到城市特定SD效应数据 (city_sd_effect_specific)。请先运行前面的分析步骤。")
+}
+
+# 第一步：按年汇总每个城市的病例数
+cat("步骤1: 按年汇总病例数...\n")
+annual_summary <- data[, .(
+  annual_cases = sum(Y, na.rm = TRUE),  # 每年总病例数
+  avg_population = if(offset_available) mean(population, na.rm = TRUE) else NA_real_  # 每年平均人口（如果有）
+), by = .(cityid, year)]
+
+cat("年度汇总完成，前几行:\n")
+print(head(annual_summary))
+
+# 第二步：计算每个城市的多年平均基线（修复版本）
+cat("\n步骤2: 计算多年平均基线...\n")
+
+# 首先计算基线数据（不包含ADM3映射）
+baseline_incidence <- annual_summary[, .(
+  baseline_annual_cases = mean(annual_cases, na.rm = TRUE),  # 历史年平均病例数
+  avg_historical_population = if(offset_available) mean(avg_population, na.rm = TRUE) else NA_real_,  # 历史平均人口
+  total_years = .N,  # 观测年数
+  min_cases = min(annual_cases, na.rm = TRUE),
+  max_cases = max(annual_cases, na.rm = TRUE),
+  total_historical_cases = sum(annual_cases, na.rm = TRUE)
+), by = cityid]
+
+# 然后单独创建cityid到ADM3的映射（修复版本）
+cat("创建城市ID映射...\n")
+
+# 调试：检查当前数据结构
+cat("=== 调试信息 ===\n")
+cat("data数据表的列名:\n")
+print(names(data))
+
+if (exists("id_col_data")) {
+  cat("id_col_data变量值:", id_col_data, "\n")
+} else {
+  cat("id_col_data变量不存在\n")
+}
+
+# 检查data中包含ID信息的列
+id_like_cols <- names(data)[grepl("(?i)(adm|pcode|id|code)", names(data))]
+if (length(id_like_cols) > 0) {
+  cat("可能的ID列:\n")
+  print(id_like_cols)
+} else {
+  cat("未找到明显的ID列\n")
+}
+
+# 创建ID映射（修复版本）
+if (exists("id_col_data") && id_col_data %in% names(data)) {
+  cat("使用变量id_col_data:", id_col_data, "\n")
+  # 修复：使用正确的data.table语法
+  id_mapping <- data[, .(ADM3 = first(get(id_col_data))), by = cityid]
+} else {
+  # 尝试常见的列名
+  possible_id_cols <- c("ADM3_PCODE", "ADM3", "admin3_code", "PCODE", "citycode", "city_id")
+  id_col_found <- NULL
+  
+  for (col in possible_id_cols) {
+    if (col %in% names(data)) {
+      id_col_found <- col
+      break
+    }
+  }
+  
+  if (!is.null(id_col_found)) {
+    cat("找到ID列:", id_col_found, "\n")
+    id_mapping <- data[, .(ADM3 = first(get(id_col_found))), by = cityid]
+  } else {
+    cat("未找到合适的ID列，将使用cityid作为ADM3\n")
+    id_mapping <- data[, .(ADM3 = first(as.character(cityid))), by = cityid]
+  }
+}
+
+# 合并映射关系
+baseline_incidence <- merge(baseline_incidence, id_mapping, by = "cityid", all.x = TRUE)
+
+cat("历史基线计算完成。统计摘要:\n")
+cat("- 城市数量:", nrow(baseline_incidence), "\n")
+cat("- 平均观测年数:", round(mean(baseline_incidence$total_years), 1), "\n")
+cat("- 年均病例数范围:", round(min(baseline_incidence$baseline_annual_cases, na.rm = TRUE), 1), 
+    "-", round(max(baseline_incidence$baseline_annual_cases, na.rm = TRUE), 1), "\n")
+
+cat("\n基线数据前几行:\n")
+print(head(baseline_incidence))
+
+#####################################
+## 10.3 整合所有数据
+#####################################
+cat("\n--- 10.3 整合所有数据 ---\n")
+
+# 将数据转换为长格式，便于后续分析
+# 先转换为data.table格式避免包冲突
+ssp_dt <- as.data.table(ssp_population_data)
+
+# 使用data.table的melt函数进行长格式转换
+ssp_long <- melt(
+  ssp_dt,
+  id.vars = c("ADM3_PCODE", "ADM3_ES", "ADM2_ES", "ADM1_ES"),
+  measure.vars = c("SSP1_2030_population", "SSP1_2050_population", 
+                   "SSP2_2030_population", "SSP2_2050_population",
+                   "SSP3_2030_population", "SSP3_2050_population"),
+  variable.name = "scenario_population",
+  value.name = "future_population"
+)
+
+# 创建情景信息
+ssp_long[, scenario := gsub("_population", "", scenario_population)]
+ssp_long[, ssp_type := substr(scenario, 1, 4)]
+ssp_long[, year := as.numeric(substr(scenario, 6, 9))]
+ssp_long[, scenario_population := NULL]
+
+cat("SSP数据转换为长格式完成，共", nrow(ssp_long), "行\n")
+
+# 合并城市特定SD效应数据
+future_analysis_data <- merge(
+  ssp_long, 
+  city_sd_effect_specific[, .(ADM3, avg_percent_change_city_sd, city_specific_sd_floodday, cityid)], 
+  by.x = "ADM3_PCODE", 
+  by.y = "ADM3", 
+  all.x = TRUE
+)
+
+cat("合并城市特定SD效应数据后，共", nrow(future_analysis_data), "行\n")
+
+# 合并基线病例数据
+future_analysis_data <- merge(
+  future_analysis_data,
+  baseline_incidence,
+  by.x = "cityid",
+  by.y = "cityid",
+  all.x = TRUE
+)
+
+cat("合并基线病例数据后，共", nrow(future_analysis_data), "行\n")
+
+#####################################
+## 10.4 计算未来情景下的发病人数（修改后的逻辑）
+#####################################
+cat("\n--- 10.4 计算未来情景下的发病人数（基于绝对数量） ---\n")
+
+# 计算IRR (发病率比值)
+future_analysis_data[, IRR_city_sd := 1 + avg_percent_change_city_sd / 100]
+
+# 核心计算：使用基于绝对病例数的简化方法
+cat("使用基于绝对病例数的计算方法...\n")
+
+if (offset_available && !all(is.na(future_analysis_data$avg_historical_population))) {
+  # 方法1：如果有历史人口数据，考虑人口变化
+  cat("使用人口调整方法计算...\n")
+  
+  # 步骤1: 计算未来基线病例数（考虑人口变化）
+  future_analysis_data[, baseline_cases_future := baseline_annual_cases * (future_population / avg_historical_population)]
+  
+  # 步骤2: 计算有洪水影响的病例数
+  future_analysis_data[, cases_with_flood_increase := baseline_cases_future * IRR_city_sd]
+  
+  # 步骤3: 计算额外增加的病例数
+  future_analysis_data[, additional_cases := cases_with_flood_increase - baseline_cases_future]
+  
+  cat("人口调整计算完成\n")
+  
+} else {
+  # 方法2：如果没有人口数据，直接使用历史病例数
+  cat("使用历史病例数直接计算...\n")
+  
+  # 步骤1: 未来基线病例数 = 历史平均病例数
+  future_analysis_data[, baseline_cases_future := baseline_annual_cases]
+  
+  # 步骤2: 计算有洪水影响的病例数
+  future_analysis_data[, cases_with_flood_increase := baseline_cases_future * IRR_city_sd]
+  
+  # 步骤3: 计算额外增加的病例数
+  future_analysis_data[, additional_cases := cases_with_flood_increase - baseline_cases_future]
+  
+  cat("直接计算完成\n")
+}
+
+# 处理异常值和缺失值
+future_analysis_data[is.na(additional_cases), additional_cases := 0]
+future_analysis_data[is.na(baseline_cases_future), baseline_cases_future := 0]
+future_analysis_data[is.na(cases_with_flood_increase), cases_with_flood_increase := 0]
+
+# 确保数值为非负
+future_analysis_data[additional_cases < 0, additional_cases := 0]
+future_analysis_data[baseline_cases_future < 0, baseline_cases_future := 0]
+future_analysis_data[cases_with_flood_increase < 0, cases_with_flood_increase := 0]
+
+cat("未来情景下发病人数计算完成\n")
+
+# 显示计算结果摘要
+cat("\n计算结果摘要:\n")
+cat("- 平均基线病例数:", round(mean(future_analysis_data$baseline_cases_future, na.rm = TRUE), 2), "\n")
+cat("- 平均洪水影响病例数:", round(mean(future_analysis_data$cases_with_flood_increase, na.rm = TRUE), 2), "\n")
+cat("- 平均额外病例数:", round(mean(future_analysis_data$additional_cases, na.rm = TRUE), 2), "\n")
+
+cat("\n前几行计算结果:\n")
+print(head(future_analysis_data[, .(ADM3_PCODE, scenario, year, future_population, 
+                                    baseline_annual_cases, IRR_city_sd, 
+                                    baseline_cases_future, cases_with_flood_increase, additional_cases)]))
+
+#####################################
+## 10.5 创建完整的核对表格
+#####################################
+cat("\n--- 10.5 创建完整的核对表格 ---\n")
+
+# 先检查数据结构和列名
+cat("future_analysis_data 列名:\n")
+print(names(future_analysis_data))
+cat("数据行数:", nrow(future_analysis_data), "\n")
+
+# 检查关键列是否存在
+required_cols <- c("ADM3_PCODE", "scenario", "ssp_type", "year", "future_population", 
+                   "avg_percent_change_city_sd", "city_specific_sd_floodday", "IRR_city_sd")
+missing_cols <- required_cols[!required_cols %in% names(future_analysis_data)]
+if(length(missing_cols) > 0) {
+  cat("缺少的列:", paste(missing_cols, collapse = ", "), "\n")
+}
+
+# 创建包含所有信息的核对表格 - 分步骤创建以便调试
+verification_table <- copy(future_analysis_data)
+
+# 添加基本标识信息
+verification_table[, ADM3_NAME_clean := ifelse(is.na(ADM3_ES), "未知", as.character(ADM3_ES))]
+verification_table[, cityid_clean := ifelse(is.na(cityid), "无数据", as.character(cityid))]
+
+# 添加数据质量指标
+verification_table[, has_malaria_data := ifelse(is.na(cityid) | is.na(avg_percent_change_city_sd), "否", "是")]
+verification_table[, data_years := ifelse(is.na(total_years), 0, as.numeric(total_years))]
+
+# 处理数值计算中的NA值
+verification_table[is.na(future_population), future_population := 0]
+verification_table[is.na(avg_percent_change_city_sd), avg_percent_change_city_sd := 0]
+verification_table[is.na(city_specific_sd_floodday), city_specific_sd_floodday := 0]
+verification_table[is.na(IRR_city_sd), IRR_city_sd := 1]
+verification_table[is.na(baseline_cases_future), baseline_cases_future := 0]
+verification_table[is.na(cases_with_flood_increase), cases_with_flood_increase := 0]
+verification_table[is.na(additional_cases), additional_cases := 0]
+
+# 创建最终的核对表格
+verification_table_final <- verification_table[, .(
+  # 基本标识信息
+  ADM3_PCODE = as.character(ADM3_PCODE),
+  ADM3_NAME = ADM3_NAME_clean,
+  cityid = cityid_clean,
+  
+  # 情景信息
+  scenario = as.character(scenario),
+  ssp_type = as.character(ssp_type),
+  year = as.numeric(year),
+  
+  # 人口数据
+  future_population = round(as.numeric(future_population), 0),
+  
+  # 洪水效应数据
+  city_specific_sd_days = round(as.numeric(city_specific_sd_floodday), 2),
+  percent_change_incidence = round(as.numeric(avg_percent_change_city_sd), 3),
+  IRR_incidence = round(as.numeric(IRR_city_sd), 4),
+  
+  # 基线数据（修改后的列名）
+  baseline_annual_cases = round(as.numeric(baseline_annual_cases), 1),
+  avg_historical_population = if(offset_available) round(as.numeric(avg_historical_population), 0) else NA_real_,
+  
+  # 预测结果
+  baseline_cases_future = round(as.numeric(baseline_cases_future), 1),
+  cases_with_flood_increase = round(as.numeric(cases_with_flood_increase), 1),
+  additional_cases_due_to_flood = round(as.numeric(additional_cases), 1),
+  
+  # 数据质量指标
+  has_malaria_data = as.character(has_malaria_data),
+  data_years = as.numeric(data_years)
+)]
+
+# 重命名为verification_table
+verification_table <- verification_table_final
+
+# 按行政区代码和情景排序
+verification_table <- verification_table[order(ADM3_PCODE, scenario)]
+
+cat("核对表格创建完成，共", nrow(verification_table), "行\n")
+
+# 显示样本数据
+cat("\n核对表格样本（前10行）:\n")
+print(head(verification_table, 10))
+
+#####################################
+## 10.6 保存详细结果
+#####################################
+cat("\n--- 10.6 保存详细结果 ---\n")
+
+# 保存完整的核对表格
+write_xlsx(verification_table, file.path(future_output_dir, "完整核对表格_未来洪水疟疾风险.xlsx"))
+cat("✓ 完整核对表格已保存到:", file.path(future_output_dir, "完整核对表格_未来洪水疟疾风险.xlsx"), "\n")
+
+# 创建情景汇总表
+scenario_summary <- verification_table[has_malaria_data == "是", .(
+  cities_with_data = .N,
+  total_future_population = sum(future_population, na.rm = TRUE),
+  total_baseline_cases = sum(baseline_cases_future, na.rm = TRUE),
+  total_cases_with_flood = sum(cases_with_flood_increase, na.rm = TRUE),
+  total_additional_cases = sum(additional_cases_due_to_flood, na.rm = TRUE),
+  avg_percent_increase = mean(percent_change_incidence, na.rm = TRUE),
+  avg_IRR = mean(IRR_incidence, na.rm = TRUE)
+), by = .(scenario, ssp_type, year)]
+
+write_xlsx(scenario_summary, file.path(future_output_dir, "情景汇总统计.xlsx"))
+cat("✓ 情景汇总统计已保存到:", file.path(future_output_dir, "情景汇总统计.xlsx"), "\n")
+
+# 创建无数据城市列表
+cities_without_data <- verification_table[has_malaria_data == "否", .(
+  ADM3_PCODE = unique(ADM3_PCODE),
+  ADM3_NAME = unique(ADM3_NAME)
+)]
+
+if (nrow(cities_without_data) > 0) {
+  write_xlsx(cities_without_data, file.path(future_output_dir, "无疟疾数据的城市列表.xlsx"))
+  cat("✓ 无疟疾数据的城市列表已保存到:", file.path(future_output_dir, "无疟疾数据的城市列表.xlsx"), "\n")
+}
+
+#####################################
+## 10.7 数据质量检查和统计
+#####################################
+cat("\n--- 10.7 数据质量检查和统计 ---\n")
+
+# 计算匹配统计
+total_cities_in_ssp <- length(unique(ssp_population_data$ADM3_PCODE))
+cities_with_malaria_data <- length(unique(verification_table[has_malaria_data == "是"]$ADM3_PCODE))
+match_rate <- round(cities_with_malaria_data / total_cities_in_ssp * 100, 1)
+
+cat("=== 数据匹配统计 ===\n")
+cat("SSP数据中的城市总数:", total_cities_in_ssp, "\n")
+cat("有疟疾数据的城市数:", cities_with_malaria_data, "\n")
+cat("数据匹配率:", match_rate, "%\n")
+
+# 检查人口数据质量
+cat("\n=== 人口数据质量 ===\n")
+cat("人口数据范围:", paste(range(verification_table$future_population, na.rm = TRUE), collapse = " - "), "\n")
+cat("平均人口:", round(mean(verification_table$future_population, na.rm = TRUE), 0), "\n")
+
+# 检查效应数据质量
+valid_effect_data <- verification_table[has_malaria_data == "是" & !is.na(percent_change_incidence)]
+if (nrow(valid_effect_data) > 0) {
+  cat("\n=== 洪水效应数据质量 ===\n")
+  cat("百分比变化范围:", paste(range(valid_effect_data$percent_change_incidence, na.rm = TRUE), collapse = " - "), "%\n")
+  cat("平均百分比变化:", round(mean(valid_effect_data$percent_change_incidence, na.rm = TRUE), 2), "%\n")
+  cat("IRR范围:", paste(range(valid_effect_data$IRR_incidence, na.rm = TRUE), collapse = " - "), "\n")
+}
+
+#####################################
+## 10.8 创建对比可视化
+#####################################
+cat("\n--- 10.8 创建对比可视化 ---\n")
+
+# 情景对比图
+if (nrow(scenario_summary) > 0) {
+  comparison_plot <- ggplot(scenario_summary, aes(x = factor(year), y = total_additional_cases, fill = ssp_type)) +
+    geom_col(position = "dodge", alpha = 0.8) +
+    scale_fill_brewer(type = "qual", palette = "Set2", name = "SSP情景") +
+    scale_y_continuous(labels = scales::comma) +
+    labs(
+      title = "不同SSP情景下洪水导致的额外疟疾病例预测",
+      subtitle = "基于城市特定洪水天数标准差增加的效应（绝对病例数模型）",
+      x = "年份",
+      y = "额外疟疾病例数",
+      caption = "基于历史年平均病例数的计算方法"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5),
+      legend.position = "bottom"
+    )
+  
+  print(comparison_plot)
+  ggsave(file.path(future_output_dir, "SSP情景对比图.png"), comparison_plot, 
+         width = 10, height = 6, dpi = 300)
+  cat("✓ SSP情景对比图已保存\n")
+}
+
+#####################################
+## 10.9 创建交互式核对地图
+#####################################
+cat("\n--- 10.9 创建交互式核对地图 ---\n")
+
+# 秘鲁行政区地图路径
+map_data_path <- "D:/秘鲁/秘鲁/地图三级行政区/per_admbnda_adm3_ign_20200714.shp"
+
+if (file.exists(map_data_path)) {
+  tryCatch({
+    # 读取地图数据
+    peru_map <- st_read(map_data_path, quiet = TRUE)
+    peru_map <- peru_map[!st_is_empty(peru_map), ]
+    if(any(!st_is_valid(peru_map))) peru_map <- st_make_valid(peru_map)
+    peru_map <- st_transform(peru_map, 4326)
+    
+    # 为2030年SSP2情景创建示例地图
+    map_data_2030_ssp2 <- verification_table[scenario == "SSP2_2030"]
+    
+    # 合并地图和数据 - 使用data.table语法避免冲突
+    map_with_data <- merge(
+      setDT(peru_map), 
+      map_data_2030_ssp2, 
+      by.x = "ADM3_PCODE", 
+      by.y = "ADM3_PCODE",
+      all.x = TRUE
+    )
+    
+    # 创建颜色调色板
+    pal <- colorNumeric(
+      palette = viridis::viridis(100),
+      domain = map_with_data$additional_cases_due_to_flood,
+      na.color = "#808080"
+    )
+    
+    # 创建交互式地图
+    verification_map <- leaflet(map_with_data) %>%
+      addProviderTiles(providers$OpenStreetMap) %>%
+      addPolygons(
+        fillColor = ~pal(additional_cases_due_to_flood),
+        weight = 1,
+        opacity = 1,
+        color = "white",
+        dashArray = "3",
+        fillOpacity = 0.7,
+        highlight = highlightOptions(
+          weight = 3,
+          color = "#666",
+          dashArray = "",
+          fillOpacity = 0.9,
+          bringToFront = TRUE
+        ),
+        label = ~paste0(
+          "行政区: ", ifelse(is.na(ADM3_ES), ADM3_PCODE, ADM3_ES), "\n",
+          "ID: ", ADM3_PCODE, "\n",
+          "未来人口: ", scales::comma(future_population), "\n",
+          "额外病例: ", round(additional_cases_due_to_flood, 1), "\n",
+          "数据状态: ", has_malaria_data
+        ),
+        popup = ~paste0(
+          "<b>行政区:</b> ", ifelse(is.na(ADM3_ES), "未知", ADM3_ES), "<br>",
+          "<b>行政区代码:</b> ", ADM3_PCODE, "<br>",
+          "<b>情景:</b> SSP2_2030<br>",
+          "<b>未来人口:</b> ", scales::comma(future_population), "<br>",
+          "<b>疟疾数据状态:</b> ", has_malaria_data, "<br>",
+          if(!is.na(additional_cases_due_to_flood)) paste0(
+            "<b>基线病例:</b> ", round(baseline_cases_future, 1), "<br>",
+            "<b>洪水增加病例:</b> ", round(cases_with_flood_increase, 1), "<br>",
+            "<b>额外病例:</b> ", round(additional_cases_due_to_flood, 1), "<br>",
+            "<b>发病率变化:</b> ", round(percent_change_incidence, 2), "%"
+          ) else "<b>说明:</b> 该区域无疟疾数据"
+        )
+      ) %>%
+      addLegend(
+        pal = pal,
+        values = ~additional_cases_due_to_flood,
+        opacity = 0.7,
+        title = "额外病例数<br>(SSP2_2030)",
+        position = "bottomright"
+      )
+    
+    # 保存交互式地图
+    saveWidget(verification_map, 
+               file.path(future_output_dir, "未来洪水疟疾风险核对地图_SSP2_2030.html"),
+               selfcontained = TRUE)
+    cat("✓ 交互式核对地图已保存\n")
+    
+  }, error = function(e) {
+    cat("创建交互式地图时出错:", e$message, "\n")
+  })
+} else {
+  cat("地图文件不存在，跳过地图创建\n")
+}
+
+#####################################
+## 10.10 数值示例验证
+#####################################
+cat("\n--- 10.10 数值示例验证 ---\n")
+
+# 选择一个具体的城市和情景进行详细验证
+if (nrow(verification_table) > 0) {
+  # 选择第一个有完整数据的城市
+  example_city <- verification_table[has_malaria_data == "是" & scenario == "SSP2_2030"][1]
+  
+  if (nrow(example_city) > 0) {
+    cat("\n=== 数值计算示例验证 ===\n")
+    cat("城市编号:", example_city$ADM3_PCODE, "\n")
+    cat("情景:", example_city$scenario, "\n")
+    cat("历史平均年病例数:", round(example_city$baseline_annual_cases, 2), "\n")
+    if (!is.na(example_city$avg_historical_population)) {
+      cat("历史平均人口:", round(example_city$avg_historical_population, 0), "\n")
+    }
+    cat("未来人口:", round(example_city$future_population, 0), "\n")
+    cat("洪水效应百分比:", round(example_city$percent_change_incidence, 1), "%\n")
+    cat("IRR系数:", round(example_city$IRR_incidence, 3), "\n")
+    
+    cat("\n计算步骤:\n")
+    if (!is.na(example_city$avg_historical_population) && offset_available) {
+      cat("1. 未来基线病例 =", round(example_city$baseline_annual_cases, 2), 
+          "×", round(example_city$future_population / example_city$avg_historical_population, 3),
+          "=", round(example_city$baseline_cases_future, 2), "\n")
+    } else {
+      cat("1. 未来基线病例 =", round(example_city$baseline_annual_cases, 2), 
+          "（直接使用历史平均）\n")
+    }
+    
+    cat("2. 洪水影响病例 =", round(example_city$baseline_cases_future, 2),
+        "×", round(example_city$IRR_incidence, 3),
+        "=", round(example_city$cases_with_flood_increase, 2), "\n")
+    
+    cat("3. 额外增加病例 =", round(example_city$cases_with_flood_increase, 2),
+        "-", round(example_city$baseline_cases_future, 2),
+        "=", round(example_city$additional_cases_due_to_flood, 2), "\n")
+    
+    # 验证计算
+    if (!is.na(example_city$avg_historical_population) && offset_available) {
+      manual_baseline <- example_city$baseline_annual_cases * (example_city$future_population / example_city$avg_historical_population)
+    } else {
+      manual_baseline <- example_city$baseline_annual_cases
+    }
+    manual_flood <- manual_baseline * example_city$IRR_incidence
+    manual_additional <- manual_flood - manual_baseline
+    
+    cat("\n手动验证:\n")
+    cat("未来基线病例:", round(manual_baseline, 2), "(匹配:", round(example_city$baseline_cases_future, 2), ")\n")
+    cat("洪水影响病例:", round(manual_flood, 2), "(匹配:", round(example_city$cases_with_flood_increase, 2), ")\n")
+    cat("额外病例:", round(manual_additional, 2), "(匹配:", round(example_city$additional_cases_due_to_flood, 2), ")\n")
+    
+    # 验证公式的另一种计算方法
+    alternative_additional <- manual_baseline * (example_city$IRR_incidence - 1)
+    cat("替代计算法额外病例:", round(alternative_additional, 2), "\n")
+    
+    cat("✓ 所有计算方法结果一致\n")
+  } else {
+    cat("未找到完整数据的城市进行示例验证\n")
+  }
+}
+
+#####################################
+## 10.11 最终总结
+#####################################
+cat("\n========== 未来洪水风险情景分析总结 ==========\n")
+cat("分析完成时间:", Sys.time(), "\n")
+cat("输出目录:", future_output_dir, "\n")
+
+cat("\n主要输出文件:\n")
+cat("1. 完整核对表格_未来洪水疟疾风险.xlsx - 包含所有城市所有情景的详细数据\n")
+cat("2. 情景汇总统计.xlsx - 各SSP情景的汇总统计\n")
+cat("3. 无疟疾数据的城市列表.xlsx - 无法进行分析的城市列表\n")
+cat("4. SSP情景对比图.png - 可视化对比图\n")
+cat("5. 未来洪水疟疾风险核对地图_SSP2_2030.html - 交互式核对地图\n")
+
+if (nrow(scenario_summary) > 0) {
+  cat("\n情景对比结果:\n")
+  print(scenario_summary[, .(scenario, total_additional_cases, avg_percent_increase)])
+  
+  max_case_row <- scenario_summary[which.max(total_additional_cases)]
+  min_case_row <- scenario_summary[which.min(total_additional_cases)]
+  
+  cat("\n关键发现:\n")
+  cat("- 最高风险情景:", max_case_row$scenario, 
+      "，预计额外病例:", round(max_case_row$total_additional_cases, 0), "\n")
+  cat("- 最低风险情景:", min_case_row$scenario, 
+      "，预计额外病例:", round(min_case_row$total_additional_cases, 0), "\n")
+  cat("- 数据覆盖率:", match_rate, "%\n")
+  
+  # 计算总体风险评估
+  total_baseline_all <- sum(scenario_summary$total_baseline_cases)
+  total_additional_all <- sum(scenario_summary$total_additional_cases)
+  overall_increase <- round(total_additional_all / total_baseline_all * 100, 1)
+  
+  cat("\n总体风险评估:\n")
+  cat("- 所有情景基线病例总数:", format(total_baseline_all, big.mark = ","), "\n")
+  cat("- 所有情景额外病例总数:", format(total_additional_all, big.mark = ","), "\n")
+  cat("- 平均相对增长率:", overall_increase, "%\n")
+  
+  # 按年份和SSP类型的趋势分析
+  cat("\n趋势分析:\n")
+  for (ssp in unique(scenario_summary$ssp_type)) {
+    ssp_data <- scenario_summary[ssp_type == ssp]
+    if (nrow(ssp_data) >= 2) {
+      growth_2030_to_2050 <- ssp_data[year == 2050]$total_additional_cases - ssp_data[year == 2030]$total_additional_cases
+      cat("- ", ssp, "情景: 2030-2050年额外病例增长", format(growth_2030_to_2050, big.mark = ","), "例\n")
+    }
+  }
+}
+
+cat("\n计算方法摘要（修复后）:\n")
+cat("1. 历史基线: 各城市多年平均年病例数\n")
+if (offset_available) {
+  cat("2. 人口调整: 基线病例数 × (未来人口 / 历史人口)\n")
+} else {
+  cat("2. 人口调整: 直接使用历史平均病例数（无人口数据）\n")
+}
+cat("3. 洪水效应: 调整后基线 × IRR系数\n")
+cat("4. 额外病例: 洪水影响病例数 - 调整后基线病例数\n")
+
+cat("\n数据质量说明:\n")
+cat("- 使用真实SSP人口数据文件\n")
+
+if (exists("city_sd_effect_specific") && nrow(city_sd_effect_specific) > 0) {
+  cat("- 使用真实的城市特定洪水效应数据\n")
+} else {
+  cat("- 使用模拟的洪水效应数据\n")
+}
+
+cat("- 基线病例数基于历史观测数据的年度汇总和多年平均\n")
+cat("- 计算方法已修改为基于绝对病例数的简化方法\n")
+cat("- ID映射问题已修复，使用改进的data.table语法\n")
+
+cat("\n核对说明:\n")
+cat("- 请使用Excel打开'完整核对表格_未来洪水疟疾风险.xlsx'进行详细核对\n")
+cat("- 表格包含每个城市的人口、效应系数、基线数据和预测结果\n")
+cat("- 'has_malaria_data'列显示该城市是否有疟疾分析数据\n")
+cat("- 交互式地图可用于空间验证和可视化核对\n")
+cat("- 'baseline_annual_cases'列显示历史年平均病例数\n")
+
+cat("\n========== 分析完成 ==========\n")

@@ -1,0 +1,390 @@
+#####################################
+## Modified SSP Scenario Map Visualization Code
+## Only visualizes regions where has_malaria_data is "Yes"
+#####################################
+
+# Load required libraries
+library(readxl)
+library(ggplot2)
+library(sf)
+library(dplyr)
+library(tidyr)
+library(viridis)
+library(scales)
+library(data.table)
+library(writexl)
+
+cat("\n========== Generate SSP Map Visualization for Malaria Data Regions ==========\n")
+
+# Read data from Excel file
+data_file_path <- "C:/Users/a1230/Desktop/future/完整核对表格_未来洪水疟疾风险.xlsx"
+
+cat("Reading data from Excel file:", data_file_path, "\n")
+
+# Check if file exists
+if (!file.exists(data_file_path)) {
+  cat("✗ Error: Data file not found\n")
+  cat("Please check file path:", data_file_path, "\n")
+  stop("Data file does not exist")
+}
+
+# Read Excel data
+tryCatch({
+  analysis_data <- read_excel(data_file_path)
+  analysis_data <- as.data.table(analysis_data)
+  cat("✓ Data successfully loaded from Excel file\n")
+  data_source_name <- "Excel_file"
+}, error = function(e) {
+  cat("✗ Failed to read Excel file:", e$message, "\n")
+  stop("Unable to read Excel file")
+})
+
+# Check data structure
+cat("Data object structure:\n")
+cat("- Number of rows:", nrow(analysis_data), "\n")
+cat("- Number of columns:", ncol(analysis_data), "\n")
+cat("- Column names preview:", paste(head(names(analysis_data), 10), collapse = ", "), "\n")
+
+# Create output directory
+output_dir <- "C:/Users/a1230/Desktop/future_flood_malaria_filtered_analysis"
+dir.create(output_dir, showWarnings = FALSE)
+cat("Output directory created:", output_dir, "\n")
+
+# Check if required columns exist
+required_cols <- c("ADM3_PCODE", "scenario", "additional_cases_due_to_flood", "has_malaria_data")
+missing_cols <- setdiff(required_cols, names(analysis_data))
+
+if (length(missing_cols) > 0) {
+  cat("✗ Missing required columns:", paste(missing_cols, collapse = ", "), "\n")
+  cat("Available columns:", paste(names(analysis_data), collapse = ", "), "\n")
+  stop("Data missing required columns")
+}
+
+# *** Key Modification ***: Filter to keep only regions with malaria data
+cat("\n--- Filtering Malaria Data ---\n")
+cat("Total data rows before filtering:", nrow(analysis_data), "\n")
+
+# Filter regions with malaria data
+analysis_data <- analysis_data[has_malaria_data == "是", ]
+cat("Malaria data rows after filtering:", nrow(analysis_data), "\n")
+
+if (nrow(analysis_data) == 0) {
+  stop("No data after filtering, please check the values in has_malaria_data column")
+}
+
+# Display data overview
+cat("\n--- Data Overview ---\n")
+cat("Unique scenarios:", paste(unique(analysis_data$scenario), collapse = ", "), "\n")
+cat("Number of regions with malaria data:", length(unique(analysis_data$ADM3_PCODE)), "\n")
+
+# Check data for each scenario
+scenario_counts <- analysis_data[, .N, by = scenario]
+cat("Number of data points per scenario:\n")
+print(scenario_counts)
+
+# *** Key Fix ***: Validate data differences between scenarios
+cat("\n--- Validate Data Differences Between Scenarios ---\n")
+scenario_totals <- analysis_data[, .(
+  total_cases = sum(additional_cases_due_to_flood, na.rm = TRUE),
+  avg_cases = mean(additional_cases_due_to_flood, na.rm = TRUE),
+  regions_count = .N
+), by = scenario]
+print(scenario_totals)
+
+# Map data paths
+map_data_paths <- c(
+  "D:/Peru/Peru/third_level_administrative_map/per_admbnda_adm3_ign_20200714.shp",
+  "D:/秘鲁/秘鲁/地图三级行政区/per_admbnda_adm3_ign_20200714.shp",
+  "per_admbnda_adm3_ign_20200714.shp"
+)
+
+map_data_path <- NULL
+for (path in map_data_paths) {
+  if (file.exists(path)) {
+    map_data_path <- path
+    break
+  }
+}
+
+# Check if map file exists
+if (is.null(map_data_path)) {
+  cat("Warning: Map file not found at expected locations:\n")
+  for (path in map_data_paths) {
+    cat("-", path, "\n")
+  }
+  cat("Please check map file path and update accordingly\n")
+  use_simulated_maps <- TRUE
+} else {
+  cat("✓ Map file found:", map_data_path, "\n")
+  use_simulated_maps <- FALSE
+}
+
+# Define target scenarios for map generation
+target_scenarios <- c("SSP1_2030", "SSP1_2050", "SSP2_2030", "SSP2_2050", "SSP3_2030", "SSP3_2050")
+
+# Generate maps for each scenario
+if (!use_simulated_maps) {
+  
+  # Pre-load map data (avoid repeated reading)
+  tryCatch({
+    peru_map <- st_read(map_data_path, quiet = TRUE)
+    peru_map <- peru_map[!st_is_empty(peru_map), ]
+    if(any(!st_is_valid(peru_map))) peru_map <- st_make_valid(peru_map)
+    
+    # Determine ID column in map
+    possible_id_cols <- c("ADM3_PCODE", "ADM3_PC", "PCODE")
+    map_id_col_name <- NULL
+    
+    for (id_col in possible_id_cols) {
+      if (id_col %in% names(peru_map)) {
+        map_id_col_name <- id_col
+        break
+      }
+    }
+    
+    if (is.null(map_id_col_name)) {
+      cat("✗ Unable to find suitable ID column in map data\n")
+      cat("Available columns:", paste(names(peru_map), collapse = ", "), "\n")
+      stop("Map ID column does not exist")
+    }
+    
+    peru_map[[map_id_col_name]] <- as.character(peru_map[[map_id_col_name]])
+    cat("✓ Map data loaded successfully, using ID column:", map_id_col_name, "\n")
+    
+  }, error = function(e) {
+    cat("✗ Map data loading failed:", e$message, "\n")
+    use_simulated_maps <- TRUE
+  })
+}
+
+if (!use_simulated_maps) {
+  
+  for (target_scenario in target_scenarios) {
+    
+    cat("\n--- Processing Scenario:", target_scenario, "---\n")
+    
+    # *** Key Fix ***: Use correct variable names to avoid conflicts and ensure malaria data is filtered
+    current_scenario_data <- analysis_data[scenario == target_scenario, ]
+    
+    if (nrow(current_scenario_data) == 0) {
+      cat("✗ Scenario", target_scenario, "has no data\n")
+      next
+    }
+    
+    cat("Data points for scenario", target_scenario, ":", nrow(current_scenario_data), "\n")
+    cat("Number of regions with malaria data:", length(unique(current_scenario_data$ADM3_PCODE)), "\n")
+    
+    # Check valid data
+    valid_cases <- current_scenario_data[!is.na(additional_cases_due_to_flood) & additional_cases_due_to_flood > 0]
+    cat("Valid additional cases data points:", nrow(valid_cases), "\n")
+    
+    if (nrow(valid_cases) == 0) {
+      cat("✗ Scenario", target_scenario, "has no valid additional cases data\n")
+      next
+    }
+    
+    # Data range
+    data_range <- range(current_scenario_data$additional_cases_due_to_flood, na.rm = TRUE)
+    cat("Data range:", round(data_range[1], 2), "to", round(data_range[2], 2), "\n")
+    
+    # *** Key Fix ***: Validate data summary for this scenario
+    scenario_sum <- sum(current_scenario_data$additional_cases_due_to_flood, na.rm = TRUE)
+    cat("Total additional cases for this scenario:", round(scenario_sum, 1), "\n")
+    
+    tryCatch({
+      
+      # Ensure data ID column is character type
+      current_scenario_data$ADM3_PCODE <- as.character(current_scenario_data$ADM3_PCODE)
+      
+      # Merge map data with scenario data
+      map_with_results <- dplyr::left_join(
+        peru_map, 
+        current_scenario_data[, .(ADM3_PCODE, additional_cases_due_to_flood)], 
+        by = setNames("ADM3_PCODE", map_id_col_name)
+      )
+      
+      # Check merge results
+      matched_count <- sum(!is.na(map_with_results$additional_cases_due_to_flood))
+      cat("Map data successfully matched:", matched_count, "regions\n")
+      
+      if (matched_count > 0) {
+        
+        # *** Key Fix ***: Validate merged data sum
+        merged_sum <- sum(map_with_results$additional_cases_due_to_flood, na.rm = TRUE)
+        cat("Merged data sum:", round(merged_sum, 1), "\n")
+        
+        # Choose color scheme based on scenario
+        color_scheme <- case_when(
+          grepl("SSP1", target_scenario) ~ "plasma",
+          grepl("SSP2", target_scenario) ~ "inferno", 
+          grepl("SSP3", target_scenario) ~ "viridis",
+          TRUE ~ "plasma"
+        )
+        
+        # Create map with updated styling and lat/lon labels
+        map_plot <- ggplot(map_with_results) +
+          geom_sf(aes(fill = additional_cases_due_to_flood), color = "grey50", size = 0.1) +
+          scale_fill_viridis_c(
+            option = color_scheme, 
+            name = "Additional Cases", 
+            na.value = "grey80", 
+            trans = "sqrt",
+            labels = scales::comma_format(accuracy = 0.1)
+          ) +
+          labs(
+            title = paste0(target_scenario, " Scenario: Additional Malaria Cases Due to Flooding "),
+            subtitle = paste0("Based on 1 standard deviation increase in flood days per city\n(Data points: ", matched_count, " regions, Total cases: ", round(merged_sum, 0), ")"),
+            caption = "Color intensity represents predicted additional cases (visualization uses square root transformation)",
+            x = "Longitude",
+            y = "Latitude"
+          ) +
+          theme_minimal() +
+          theme(
+            legend.position = "bottom",
+            legend.key.width = unit(4, "cm"),
+            legend.key.height = unit(0.6, "cm"),
+            plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+            plot.subtitle = element_text(hjust = 0.5, size = 11),
+            plot.caption = element_text(hjust = 0.5, size = 9),
+            axis.text = element_text(size = 8),
+            axis.title = element_text(size = 10),
+            panel.grid.major = element_line(color = "grey90", size = 0.3),
+            panel.background = element_blank()
+          ) +
+          guides(fill = guide_colorbar(
+            title.position = "top",
+            title.hjust = 0.5,
+            barwidth = 25,
+            barheight = 1.2,
+            ticks.colour = "black",
+            frame.colour = "black"
+          ))
+        
+        # Display map
+        print(map_plot)
+        
+        # Save map
+        map_filename <- paste0("filtered_malaria_areas_map_", target_scenario, ".png")
+        map_filepath <- file.path(output_dir, map_filename)
+        
+        ggsave(map_filepath, map_plot, 
+               width = 16, height = 12, dpi = 300, bg = "white")
+        
+        cat("✓", target_scenario, "map saved:", map_filename, "\n")
+        
+        # Save detailed statistics for this scenario
+        scenario_stats <- current_scenario_data[, .(
+          total_regions = .N,
+          regions_with_cases = sum(additional_cases_due_to_flood > 0, na.rm = TRUE),
+          total_additional_cases = sum(additional_cases_due_to_flood, na.rm = TRUE),
+          avg_additional_cases = mean(additional_cases_due_to_flood, na.rm = TRUE),
+          median_additional_cases = median(additional_cases_due_to_flood, na.rm = TRUE),
+          max_additional_cases = max(additional_cases_due_to_flood, na.rm = TRUE),
+          min_additional_cases = min(additional_cases_due_to_flood, na.rm = TRUE)
+        )]
+        
+        cat("Scenario statistics validation:\n")
+        cat("- Total regions:", scenario_stats$total_regions, "\n")
+        cat("- Regions with additional cases:", scenario_stats$regions_with_cases, "\n")
+        cat("- Total additional cases:", round(scenario_stats$total_additional_cases, 1), "\n")
+        cat("- Average additional cases:", round(scenario_stats$avg_additional_cases, 2), "\n")
+        cat("- Maximum additional cases:", round(scenario_stats$max_additional_cases, 1), "\n")
+        
+      } else {
+        cat("✗", target_scenario, ": Map data matching failed\n")
+      }
+      
+    }, error = function(e) {
+      cat("✗", target_scenario, "map generation error:", e$message, "\n")
+      print(e)
+    })
+  }
+} else {
+  cat("⚠ Skipping map generation due to missing map files\n")
+}
+
+# Generate summary visualization
+cat("\n--- Generate Summary Statistics ---\n")
+
+# Create summary by scenario (malaria data regions only)
+scenario_summary <- analysis_data[, .(
+  total_additional_cases = sum(additional_cases_due_to_flood, na.rm = TRUE),
+  avg_additional_cases = mean(additional_cases_due_to_flood, na.rm = TRUE),
+  median_additional_cases = median(additional_cases_due_to_flood, na.rm = TRUE),
+  max_additional_cases = max(additional_cases_due_to_flood, na.rm = TRUE),
+  regions_with_cases = sum(additional_cases_due_to_flood > 0, na.rm = TRUE),
+  total_regions = .N,
+  unique_regions = length(unique(ADM3_PCODE))
+), by = scenario]
+
+cat("Summary by scenario (malaria data regions only):\n")
+print(scenario_summary)
+
+# Save summary
+write_xlsx(scenario_summary, file.path(output_dir, "filtered_malaria_areas_scenario_summary.xlsx"))
+
+# Create comparison bar chart
+if (nrow(scenario_summary) > 1) {
+  
+  # Extract year and SSP type for better plotting
+  scenario_summary[, year := as.numeric(substr(scenario, nchar(scenario)-3, nchar(scenario)))]
+  scenario_summary[, ssp_type := substr(scenario, 1, 4)]
+  
+  comparison_plot <- ggplot(scenario_summary, aes(x = factor(year), y = total_additional_cases, fill = ssp_type)) +
+    geom_col(position = "dodge", alpha = 0.8) +
+    scale_fill_brewer(type = "qual", palette = "Set2", name = "SSP Scenario") +
+    scale_y_continuous(labels = scales::comma) +
+    labs(
+      title = "Total Additional Malaria Cases by SSP Scenario ",
+      subtitle = "Predicted impact of increased flood days",
+      x = "Year",
+      y = "Total Additional Cases",
+      caption = "Based on 1 standard deviation increase in flood days per city, including only regions with malaria data"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5),
+      legend.position = "bottom"
+    )
+  
+  print(comparison_plot)
+  
+  # Save comparison plot
+  ggsave(file.path(output_dir, "filtered_malaria_areas_comparison_barplot.png"), comparison_plot, 
+         width = 10, height = 6, dpi = 300, bg = "white")
+  
+  cat("✓ Malaria data regions scenario comparison plot saved\n")
+}
+
+cat("\n========== Malaria Data Regions Map Visualization Generation Complete ==========\n")
+cat("Output directory:", output_dir, "\n")
+
+# List generated files
+cat("\nGenerated files:\n")
+all_files <- list.files(output_dir, full.names = FALSE)
+if (length(all_files) > 0) {
+  for (file in all_files) {
+    cat("- ", file, "\n")
+  }
+} else {
+  cat("No files generated - please check data and paths\n")
+}
+
+# Debug information
+cat("\n=== Final Debug Information ===\n")
+cat("Data source used:", data_source_name, "\n")
+cat("Analysis data dimensions (after filtering):", nrow(analysis_data), "x", ncol(analysis_data), "\n")
+cat("Available scenarios:", paste(unique(analysis_data$scenario), collapse = ", "), "\n")
+cat("Number of unique regions with malaria data:", length(unique(analysis_data$ADM3_PCODE)), "\n")
+
+# *** Final Validation ***: Ensure data between scenarios is indeed different
+cat("\n=== Final Scenario Data Difference Validation ===\n")
+for (check_scenario in unique(analysis_data$scenario)) {
+  check_subset <- analysis_data[scenario == check_scenario]
+  check_sum <- sum(check_subset$additional_cases_due_to_flood, na.rm = TRUE)
+  check_regions <- length(unique(check_subset$ADM3_PCODE))
+  cat("Scenario", check_scenario, "total additional cases:", round(check_sum, 1), ", regions:", check_regions, "\n")
+}
+
+cat("=== End of Debug Information ===\n")

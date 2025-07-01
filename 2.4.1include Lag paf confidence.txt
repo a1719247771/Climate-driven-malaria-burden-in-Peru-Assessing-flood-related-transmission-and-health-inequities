@@ -1,0 +1,726 @@
+# Flood Attribution Analysis and Geographic Visualization for Malaria
+# Based on Poisson Fixed Effects Model (Model 2 with lag terms: Total flood effect analysis)
+# Enhanced version: Using Delta Method for confidence intervals ONLY
+
+# Load necessary packages
+library(fixest)       # For fixed effects models
+library(data.table)   # For efficient data processing
+library(readxl)       # For reading Excel files
+library(writexl)      # For writing Excel files
+library(dplyr)        # For data manipulation
+library(tidyr)        # For data reshaping
+library(ggplot2)      # For data visualization
+library(RColorBrewer) # For color schemes
+library(viridis)      # For better color schemes
+library(gridExtra)    # For combining multiple plots
+library(scales)       # For formatting legends
+library(sf)           # For spatial data processing
+
+# Try to load spatial analysis packages
+spatial_analysis_available <- require(spdep)
+if(!spatial_analysis_available) {
+  cat("Note: Spatial analysis package 'spdep' not installed, will skip spatial autocorrelation analysis.\n")
+}
+
+#####################################
+## 1. Data Preparation
+#####################################
+
+# Read data
+data <- read_excel("C:/Users/a1230/Desktop/nuejidata.xlsx")
+
+# Convert to data.table for improved processing efficiency
+setDT(data)
+
+# Check data structure
+cat("\nData structure overview:\n")
+str(data)
+
+# Verify ADM3 column exists
+if("ADM3" %in% colnames(data)) {
+  cat("\nFound ADM3 column, can be used for map matching\n")
+  id_col <- "ADM3"
+} else if("ADM3_PCODE" %in% colnames(data)) {
+  cat("\nFound ADM3_PCODE column, can be used for map matching\n")
+  id_col <- "ADM3_PCODE"
+} else {
+  cat("\nWarning: Map matching column (ADM3/ADM3_PCODE) not found, will use cityid as identifier\n")
+  id_col <- "cityid"
+}
+
+# Data preprocessing
+data[, year := as.integer(year)]
+data[, week := as.integer(week)]
+data[, cityid := as.factor(cityid)]
+data[, yearweek := paste0(year, "_", sprintf("%02d", week))]
+data[, yearweek := as.factor(yearweek)]
+
+# Ensure data is sorted by cityid and time (for creating lag variables)
+setorder(data, cityid, year, week)
+
+#####################################
+## 2. Create Lag Variables
+#####################################
+
+cat("\n======= Creating Flood Lag Variables =======\n")
+
+# Create lag variables for each city
+data[, flood_lag1 := shift(flood, 1), by = cityid]  # 1-week lag
+data[, flood_lag2 := shift(flood, 2), by = cityid]  # 2-week lag
+data[, flood_lag3 := shift(flood, 3), by = cityid]  # 3-week lag
+data[, flood_lag4 := shift(flood, 4), by = cityid]  # 4-week lag
+
+# Set NA values to 0 (for the first few weeks of data)
+flood_lag_vars <- c("flood_lag1", "flood_lag2", "flood_lag3", "flood_lag4")
+for(var in flood_lag_vars) {
+  data[is.na(get(var)), (var) := 0]
+}
+
+# Check lag variable creation
+cat("Flood variable statistics:\n")
+cat("Current flood (flood):", sum(data$flood), "weeks\n")
+cat("1-week lag (flood_lag1):", sum(data$flood_lag1), "weeks\n")
+cat("2-week lag (flood_lag2):", sum(data$flood_lag2), "weeks\n")
+cat("3-week lag (flood_lag3):", sum(data$flood_lag3), "weeks\n")
+cat("4-week lag (flood_lag4):", sum(data$flood_lag4), "weeks\n")
+
+# Temperature variables
+data[, temp_range := max - min]  # Temperature range
+data[, temperature_sq := temperature^2]  # Quadratic temperature term
+
+# Prepare population offset (using population variable)
+if ("population" %in% names(data)) {
+  data[, population := as.numeric(population)]
+  data[population <= 0 | is.na(population), population := 1]  # Avoid log(0) or NA
+  data[, log_population_offset := log(population)]
+  cat("\n✓ Created log_population_offset for population offset in model\n")
+  cat("Population data statistics:\n")
+  print(summary(data$population))
+  offset_available <- TRUE
+} else {
+  cat("\nWarning: No 'population' column in data, model will not use population offset.\n")
+  offset_available <- FALSE
+}
+
+# Prepare population density variable (as control variable)
+if ("population_density" %in% names(data)) {
+  data[, population_density := as.numeric(population_density)]
+  data[, log_population_density := log(population_density + 1)]
+  cat("\n✓ Created log_population_density for control variable in model\n")
+  cat("Population density data statistics:\n")
+  print(summary(data$population_density))
+  pop_density_available <- TRUE
+} else {
+  cat("\nWarning: No 'population_density' column in data.\n")
+  pop_density_available <- FALSE
+}
+
+# Check other socioeconomic variables
+if ("light_density" %in% names(data)) {
+  data[, light_density := as.numeric(light_density)]
+  data[, log_light_density := log(light_density + 1)]
+  cat("✓ Created log_light_density variable\n")
+  light_density_available <- TRUE
+} else {
+  cat("Warning: No 'light_density' column in data.\n")
+  light_density_available <- FALSE
+}
+
+if ("LandUse_10" %in% names(data)) {
+  data[, urban_index := LandUse_10]
+  cat("✓ Created urban_index variable\n")
+  urban_available <- TRUE
+} else {
+  cat("Warning: No 'LandUse_10' column in data.\n")
+  urban_available <- FALSE
+}
+
+# Check if all socioeconomic variables exist
+socioeconomic_vars_exist <- pop_density_available && light_density_available && urban_available
+
+if(socioeconomic_vars_exist) {
+  cat("\n✓ All socioeconomic variables prepared, will use complete Model 2\n")
+} else {
+  cat("\nWarning: Some socioeconomic variables missing, will build model with available variables\n")
+  # List missing variables
+  missing_vars <- c()
+  if(!pop_density_available) missing_vars <- c(missing_vars, "population_density")
+  if(!light_density_available) missing_vars <- c(missing_vars, "light_density")
+  if(!urban_available) missing_vars <- c(missing_vars, "LandUse_10")
+  cat("Missing variables:", paste(missing_vars, collapse=", "), "\n")
+}
+
+#####################################
+## 3. MODEL 2: Poisson Fixed Effects Model with Lag Terms
+#####################################
+
+cat("\n======= MODEL 2: Poisson Fixed Effects Model with Flood Lag Terms =======\n")
+
+# Build list of available control variables
+control_vars <- c("temperature", "temperature_sq", "temp_range",
+                  "pressure", "wind_speed", "relative_humidity", 
+                  "total_precipitation_sum")
+
+# Add flood lag terms
+flood_vars <- c("flood", "flood_lag1", "flood_lag2", "flood_lag3", "flood_lag4")
+cat("Flood variables (including lags):", paste(flood_vars, collapse = ", "), "\n")
+
+# Add available socioeconomic variables
+if(pop_density_available) {
+  control_vars <- c(control_vars, "log_population_density")
+  cat("✓ Including population density control variable\n")
+}
+if(light_density_available) {
+  control_vars <- c(control_vars, "log_light_density")
+  cat("✓ Including light density control variable\n")
+}
+if(urban_available) {
+  control_vars <- c(control_vars, "urban_index")
+  cat("✓ Including urbanization index control variable\n")
+}
+
+# Build model formula (including all flood lag terms)
+formula_str <- paste("Y ~", paste(flood_vars, collapse = " + "), "+", 
+                     paste(control_vars, collapse = " + "), "| cityid + yearweek")
+cat("\nModel formula:", formula_str, "\n")
+
+# Estimate model based on population offset availability
+if (offset_available) {
+  model2_lag <- fepois(as.formula(formula_str), 
+                       offset = ~log_population_offset,
+                       data = data)
+  cat("\n✓ Model includes population offset (log_population_offset)\n")
+  cat("   This means the model analyzes malaria incidence rates rather than absolute case counts\n")
+} else {
+  model2_lag <- fepois(as.formula(formula_str), data = data)
+  cat("\n⚠ Model does not include population offset, analyzes absolute case counts\n")
+}
+
+# Output model results
+cat("\nModel 2 (with lag terms) results summary:\n")
+print(summary(model2_lag))
+
+# Extract flood effect coefficients
+flood_coefs <- coef(model2_lag)[flood_vars]
+cat("\nFlood lag effect coefficients:\n")
+for(i in 1:length(flood_coefs)) {
+  cat(paste0(names(flood_coefs)[i], ": ", round(flood_coefs[i], 4), "\n"))
+}
+
+# Calculate total flood effect
+total_flood_effect <- sum(flood_coefs, na.rm = TRUE)
+cat("\nTotal flood effect (sum of all lag terms):", round(total_flood_effect, 4), "\n")
+
+if(offset_available) {
+  cat("Interpretation: When floods occur, the expected total change rate in malaria incidence is", 
+      round((exp(total_flood_effect) - 1) * 100, 2), "%\n")
+} else {
+  cat("Interpretation: When floods occur, the expected total change rate in malaria case count is", 
+      round((exp(total_flood_effect) - 1) * 100, 2), "%\n")
+}
+
+#####################################
+## 4. Create Output Directory
+#####################################
+
+# Create output directory
+output_dir <- "C:/Users/a1230/Desktop/pic"
+dir.create(output_dir, showWarnings = FALSE)
+
+#####################################
+## 5. Delta Method for Total Flood Effect Confidence Intervals
+#####################################
+
+cat("\n======= Using Delta Method for Total Flood Effect Confidence Intervals =======\n")
+
+# Get model coefficients and covariance matrix
+model_coef <- coef(model2_lag)
+model_vcov <- vcov(model2_lag)
+
+# Extract flood-related coefficients
+flood_coef_indices <- which(names(model_coef) %in% flood_vars)
+flood_coefs_ordered <- model_coef[flood_coef_indices]
+flood_vcov <- model_vcov[flood_coef_indices, flood_coef_indices]
+
+cat("Flood coefficients extracted:", names(flood_coefs_ordered), "\n")
+cat("Flood covariance matrix dimensions:", dim(flood_vcov), "\n")
+
+# Function to calculate total flood effect and PAF with Delta method confidence intervals
+calculate_flood_effect_ci <- function(data, flood_coefs, flood_vcov, alpha = 0.05) {
+  
+  # Create flood exposure matrix (each row is an observation, each column is a lag period)
+  flood_matrix <- as.matrix(data[, ..flood_vars])
+  
+  # Calculate total flood effect = ∑(βj × flood_it-j)
+  total_flood_effect <- as.vector(flood_matrix %*% flood_coefs)
+  
+  # Calculate variance of total flood effect using Delta method
+  # Var(∑βj × flood_it-j) = flood_vector' × Vcov(β) × flood_vector
+  total_effect_variance <- numeric(nrow(data))
+  for(i in 1:nrow(data)) {
+    flood_vector <- as.vector(flood_matrix[i, ])
+    total_effect_variance[i] <- t(flood_vector) %*% flood_vcov %*% flood_vector
+  }
+  
+  # Calculate standard errors
+  total_effect_se <- sqrt(total_effect_variance)
+  
+  # Calculate confidence intervals for total flood effect
+  z_value <- qnorm(1 - alpha/2)
+  total_effect_lower <- total_flood_effect - z_value * total_effect_se
+  total_effect_upper <- total_flood_effect + z_value * total_effect_se
+  
+  # Calculate PAF = 1 - exp(-total_flood_effect)
+  paf <- 1 - exp(-total_flood_effect)
+  
+  # Use Delta method for PAF confidence intervals
+  # PAF = g(θ) = 1 - exp(-θ), g'(θ) = exp(-θ)
+  # Var(PAF) ≈ [g'(θ)]² × Var(θ) = [exp(-θ)]² × Var(θ)
+  paf_variance <- (exp(-total_flood_effect))^2 * total_effect_variance
+  paf_se <- sqrt(paf_variance)
+  
+  # PAF confidence intervals
+  paf_lower <- paf - z_value * paf_se
+  paf_upper <- paf + z_value * paf_se
+  
+  # Ensure PAF is within [0,1] range
+  paf_lower <- pmax(0, paf_lower)
+  paf_upper <- pmin(1, paf_upper)
+  
+  # Return results
+  return(data.table(
+    paf = paf,
+    paf_lower = paf_lower,
+    paf_upper = paf_upper,
+    paf_percent = paf * 100,
+    paf_percent_lower = paf_lower * 100,
+    paf_percent_upper = paf_upper * 100
+  ))
+}
+
+# Calculate confidence intervals for all observations
+flood_ci_results <- calculate_flood_effect_ci(data, flood_coefs_ordered, flood_vcov)
+
+# Merge results with original data
+data_with_delta_ci <- cbind(data, flood_ci_results)
+
+# Calculate attributable cases using Delta method PAF
+data_with_delta_ci[, `:=`(
+  # Attributable cases using actual observed cases × PAF
+  attributable_cases_delta = paf * Y,
+  
+  # Attributable cases confidence intervals using actual observed cases
+  attributable_cases_delta_lower = paf_lower * Y,
+  attributable_cases_delta_upper = paf_upper * Y
+)]
+
+# Identify flood periods (current or any lag period has flood)
+data_with_delta_ci[, any_flood := pmax(flood, flood_lag1, flood_lag2, flood_lag3, flood_lag4, na.rm = TRUE)]
+
+#####################################
+## 6. Flood Period Attribution Analysis with Delta Method
+#####################################
+
+cat("\n======= Flood Period Attribution Analysis with Delta Method =======\n")
+
+# Filter flood periods with Delta method results
+flood_periods_delta <- data_with_delta_ci[any_flood > 0]
+
+cat("Total flood period observations:", nrow(flood_periods_delta), "\n")
+cat("Proportion of total observations:", round(nrow(flood_periods_delta)/nrow(data_with_delta_ci)*100, 2), "%\n")
+
+# City-level aggregation with Delta method confidence intervals
+city_attribution_final <- flood_periods_delta[, .(
+  # Basic information
+  ADM3 = first(get(id_col)),
+  flood_weeks = .N,
+  total_cases = sum(Y, na.rm = TRUE),
+  
+  # Delta method PAF statistics
+  mean_paf_percent = mean(paf_percent, na.rm = TRUE),
+  mean_paf_lower = mean(paf_percent_lower, na.rm = TRUE),
+  mean_paf_upper = mean(paf_percent_upper, na.rm = TRUE),
+  
+  # Attributable cases with Delta method
+  total_attributable_cases = sum(attributable_cases_delta, na.rm = TRUE),
+  total_attributable_lower = sum(attributable_cases_delta_lower, na.rm = TRUE),
+  total_attributable_upper = sum(attributable_cases_delta_upper, na.rm = TRUE),
+  
+  # Flood intensity
+  mean_flood_intensity = mean(any_flood, na.rm = TRUE),
+  max_flood_intensity = max(any_flood, na.rm = TRUE),
+  
+  # Population statistics (if available)
+  avg_population = if ("population" %in% names(data_with_delta_ci)) mean(population, na.rm = TRUE) else NA
+  
+), by = .(cityid)][order(-mean_paf_percent)]
+
+# Calculate week-level attribution data for flood periods
+flood_week_attribution_delta <- flood_periods_delta %>%
+  group_by(cityid, year, week) %>%
+  summarise(
+    actual_cases = sum(Y, na.rm = TRUE),
+    attributable_cases_delta = sum(attributable_cases_delta, na.rm = TRUE),
+    attributable_cases_lower = sum(attributable_cases_delta_lower, na.rm = TRUE),
+    attributable_cases_upper = sum(attributable_cases_delta_upper, na.rm = TRUE),
+    paf_percent = mean(paf_percent, na.rm = TRUE),
+    paf_percent_lower = mean(paf_percent_lower, na.rm = TRUE),
+    paf_percent_upper = mean(paf_percent_upper, na.rm = TRUE),
+    flood_intensity = mean(any_flood, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+#####################################
+## 7. Visualization with Delta Method
+#####################################
+
+# 1. City-level attribution with Delta method confidence intervals (top 20 cities)
+attribution_plot <- ggplot(city_attribution_final[1:min(20, nrow(city_attribution_final)),], 
+                           aes(x = reorder(cityid, mean_paf_percent))) +
+  geom_col(aes(y = mean_paf_percent), fill = "#e31a1c", alpha = 0.7) +
+  geom_errorbar(aes(ymin = mean_paf_lower, ymax = mean_paf_upper), 
+                width = 0.3, color = "darkred", size = 0.8) +
+  labs(title = "洪水归因比例及95%置信区间 (Delta方法) - 前20个城市",
+       subtitle = paste0("基于洪水总效应的统计推断", 
+                         ifelse(offset_available, " (考虑人口偏移)", " (未考虑人口偏移)")),
+       x = "城市ID", 
+       y = "归因比例 (%)") +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    axis.text.y = element_text(size = 8)
+  )
+
+ggsave(file.path(output_dir, "attribution_percent_delta_ci.png"), 
+       attribution_plot, width = 12, height = 8, dpi = 300)
+
+# 2. Attributable cases with confidence intervals
+cases_plot <- ggplot(city_attribution_final[1:min(20, nrow(city_attribution_final)),], 
+                     aes(x = reorder(cityid, total_attributable_cases))) +
+  geom_col(aes(y = total_attributable_cases), fill = "#1f78b4", alpha = 0.7) +
+  geom_errorbar(aes(ymin = total_attributable_lower, ymax = total_attributable_upper), 
+                width = 0.3, color = "darkblue", size = 0.8) +
+  labs(title = "洪水归因发病数及95%置信区间 (Delta方法) - 前20个城市",
+       subtitle = "洪水期间总归因发病数",
+       x = "城市ID", 
+       y = "归因发病数") +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    axis.text.y = element_text(size = 8)
+  )
+
+ggsave(file.path(output_dir, "attributable_cases_delta_ci.png"), 
+       cases_plot, width = 12, height = 8, dpi = 300)
+
+# 3. Scatter plot of flood intensity vs attribution fraction (flood periods only)
+flood_intensity_plot <- ggplot(flood_periods_delta, 
+                               aes(x = any_flood, y = paf_percent)) +
+  geom_point(alpha = 0.6, color = "#e31a1c") +
+  geom_smooth(method = "loess", se = TRUE, color = "darkred") +
+  labs(title = "洪水期间：洪水强度与疟疾归因比例关系 (Delta方法)",
+       subtitle = paste0("基于Delta方法的统计推断", 
+                         ifelse(offset_available, " (考虑人口偏移)", " (未考虑人口偏移)")),
+       x = "洪水强度",
+       y = "归因比例 (%)") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 12, face = "bold"),
+    plot.subtitle = element_text(size = 10)
+  )
+
+ggsave(file.path(output_dir, "flood_intensity_vs_attribution_delta.png"), 
+       flood_intensity_plot, width = 10, height = 7, dpi = 300)
+
+# 4. Box plot of flood period attribution fractions (grouped by city, showing top 15 cities)
+top_15_cities <- city_attribution_final$cityid[1:min(15, nrow(city_attribution_final))]
+flood_periods_top15 <- flood_periods_delta[cityid %in% top_15_cities]
+
+flood_boxplot <- ggplot(flood_periods_top15, 
+                        aes(x = factor(cityid, levels = top_15_cities), 
+                            y = paf_percent)) +
+  geom_boxplot(fill = "#e31a1c", alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.4, size = 0.8) +
+  labs(title = "洪水期间城市归因比例分布 (Delta方法) - 前15个城市",
+       subtitle = paste0("基于Delta方法的统计推断", 
+                         ifelse(offset_available, " (考虑人口偏移)", " (未考虑人口偏移)")),
+       x = "城市ID",
+       y = "归因比例 (%)") +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 8),
+    plot.title = element_text(size = 12, face = "bold"),
+    plot.subtitle = element_text(size = 10)
+  )
+
+ggsave(file.path(output_dir, "attribution_boxplot_delta.png"), 
+       flood_boxplot, width = 12, height = 8, dpi = 300)
+
+# 5. Time series plot: showing changes in attribution fraction during flood periods
+if(nrow(flood_week_attribution_delta) > 0) {
+  # Select top 5 cities with most flood weeks for time series display
+  top_flood_cities <- city_attribution_final %>%
+    arrange(desc(flood_weeks)) %>%
+    slice_head(n = 5) %>%
+    pull(cityid)
+  
+  flood_time_series_data <- flood_week_attribution_delta %>%
+    filter(cityid %in% top_flood_cities) %>%
+    mutate(date = as.Date(paste(year, (week-1)*7 + 1, sep = "-"), format = "%Y-%j"))
+  
+  flood_timeseries_plot <- ggplot(flood_time_series_data, 
+                                  aes(x = date, y = paf_percent, color = cityid)) +
+    geom_line(size = 1, alpha = 0.8) +
+    geom_point(size = 2, alpha = 0.8) +
+    geom_ribbon(aes(ymin = paf_percent_lower, ymax = paf_percent_upper, fill = cityid), 
+                alpha = 0.2, color = NA) +
+    facet_wrap(~cityid, scales = "free_x", ncol = 2) +
+    labs(title = "洪水期间归因比例时间序列 (Delta方法) - 前5个洪水最多城市",
+         subtitle = paste0("含95%置信区间", 
+                           ifelse(offset_available, " (考虑人口偏移)", " (未考虑人口偏移)")),
+         x = "时间",
+         y = "归因比例 (%)",
+         color = "城市ID",
+         fill = "城市ID") +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      plot.title = element_text(size = 12, face = "bold"),
+      plot.subtitle = element_text(size = 10),
+      legend.position = "none"  # Already have facet labels, no need for legend
+    )
+  
+  ggsave(file.path(output_dir, "timeseries_attribution_delta.png"), 
+         flood_timeseries_plot, width = 12, height = 8, dpi = 300)
+}
+
+#####################################
+## 8. Map Visualization with Delta Method
+#####################################
+
+# Read shapefile map data
+map_path <- "D:/秘鲁/秘鲁/地图三级行政区/per_admbnda_adm3_ign_20200714.shp"
+
+tryCatch({
+  map_data <- st_read(map_path, quiet = TRUE)
+  cat("\nSuccessfully read map data containing", nrow(map_data), "administrative regions\n")
+  
+  # Check shapefile structure
+  map_cols <- colnames(map_data)
+  cat("Map data contains fields:", paste(head(map_cols, 10), collapse=", "), 
+      ifelse(length(map_cols) > 10, "...", ""), "\n")
+  
+  # Determine matching field
+  if("ADM3_PCODE" %in% map_cols) {
+    map_id_field <- "ADM3_PCODE"
+    cat("Using ADM3_PCODE field for matching\n")
+  } else {
+    cat("Warning: ADM3_PCODE field missing, checking other fields:\n")
+    print(grep("ADM|ID|CODE", map_cols, value = TRUE))
+    map_id_field <- map_cols[1]
+    cat("Using", map_id_field, "field for matching\n")
+  }
+  
+  # Prepare attribution data for map matching
+  attribution_for_map <- city_attribution_final %>%
+    mutate(!!map_id_field := ADM3)
+  
+  # Merge map data and attribution data
+  map_with_attribution <- map_data %>%
+    left_join(attribution_for_map, by = map_id_field)
+  
+  # Check matching results
+  matched_regions <- sum(!is.na(map_with_attribution$mean_paf_percent))
+  total_regions <- nrow(map_with_attribution)
+  match_rate <- matched_regions / total_regions * 100
+  
+  cat("\nMap matching results:", matched_regions, "/", total_regions, 
+      "regions (", round(match_rate, 1), "%)\n")
+  
+  # Flood attribution map with Delta method
+  subtitle_text_map <- paste0("基于Delta方法的洪水总效应置信区间", 
+                              ifelse(offset_available, " (考虑人口偏移)", " (未考虑人口偏移)"))
+  
+  flood_attribution_map <- ggplot(map_with_attribution) +
+    geom_sf(aes(fill = mean_paf_percent), color = "white", size = 0.1) +
+    scale_fill_viridis(
+      option = "plasma",
+      name = "洪水期间\n归因比例 (%)\n(Delta方法)",
+      na.value = "grey80",
+      guide = guide_colorbar(
+        barwidth = 15, barheight = 0.5,
+        title.position = "top"
+      )
+    ) +
+    labs(
+      title = "基于洪水滞后效应的疟疾负担归因比例地图 (Delta方法)",
+      subtitle = subtitle_text_map
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5),
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    )
+  
+  # Flood frequency map
+  flood_frequency_map <- ggplot(map_with_attribution) +
+    geom_sf(aes(fill = flood_weeks), color = "white", size = 0.1) +
+    scale_fill_viridis(
+      option = "viridis",
+      name = "洪水周数",
+      na.value = "grey80",
+      guide = guide_colorbar(
+        barwidth = 15, barheight = 0.5,
+        title.position = "top"
+      )
+    ) +
+    labs(
+      title = "各地区洪水周数分布",
+      subtitle = "研究期间洪水事件频率"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5),
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    )
+  
+  # Save map visualization results
+  ggsave(file.path(output_dir, "flood_attribution_map_delta.png"), 
+         flood_attribution_map, width = 12, height = 10, dpi = 300)
+  ggsave(file.path(output_dir, "flood_frequency_map.png"), 
+         flood_frequency_map, width = 12, height = 10, dpi = 300)
+  
+  # Create combined map
+  combined_flood_maps <- grid.arrange(
+    flood_attribution_map, flood_frequency_map,
+    ncol = 1, nrow = 2,
+    top = grid::textGrob("洪水滞后效应归因分析地理可视化 (Delta方法)", 
+                         gp = grid::gpar(fontsize = 16, font = 2))
+  )
+  
+  # Save combined map
+  ggsave(file.path(output_dir, "combined_flood_attribution_maps_delta.png"), 
+         combined_flood_maps, width = 12, height = 16, dpi = 300)
+  
+}, error = function(e) {
+  cat("\nError reading map data:", e$message, "\n")
+  cat("Skipping map visualization\n")
+})
+
+#####################################
+## 9. Save Results (Delta Method Only)
+#####################################
+
+# Save Delta method results
+write.csv(data_with_delta_ci, file.path(output_dir, "data_with_delta_ci.csv"), row.names = FALSE)
+write.csv(flood_periods_delta, file.path(output_dir, "flood_periods_delta_ci.csv"), row.names = FALSE)
+write.csv(city_attribution_final, file.path(output_dir, "city_attribution_final.csv"), row.names = FALSE)
+write.csv(flood_week_attribution_delta, file.path(output_dir, "flood_week_attribution_delta.csv"), row.names = FALSE)
+
+#####################################
+## 10. Summary Report (Delta Method)
+#####################################
+
+# Calculate global attribution fraction for flood periods using Delta method
+flood_global_attribution_delta <- data.frame(
+  # Weighted by flood weeks
+  weighted_by_flood_weeks = weighted.mean(city_attribution_final$mean_paf_percent, 
+                                          w = city_attribution_final$flood_weeks, na.rm = TRUE),
+  # Weighted by flood period case count
+  weighted_by_flood_cases = weighted.mean(city_attribution_final$mean_paf_percent, 
+                                          w = city_attribution_final$total_cases, na.rm = TRUE),
+  # Unweighted average
+  unweighted = mean(city_attribution_final$mean_paf_percent, na.rm = TRUE)
+)
+
+# Save flood period global attribution results
+write.csv(flood_global_attribution_delta, file.path(output_dir, "flood_global_attribution_delta.csv"), row.names = FALSE)
+
+# Calculate flood period overall statistics using Delta method
+flood_overall_stats_delta <- data.frame(
+  total_observations = nrow(data_with_delta_ci),
+  flood_period_observations = nrow(flood_periods_delta),
+  flood_occurrence_rate = nrow(flood_periods_delta) / nrow(data_with_delta_ci) * 100,
+  total_cities_with_floods = length(unique(flood_periods_delta$cityid)),
+  total_flood_cases = sum(flood_periods_delta$Y, na.rm = TRUE),
+  total_attributable_cases_delta = sum(flood_periods_delta$attributable_cases_delta, na.rm = TRUE),
+  total_attributable_cases_lower = sum(flood_periods_delta$attributable_cases_delta_lower, na.rm = TRUE),
+  total_attributable_cases_upper = sum(flood_periods_delta$attributable_cases_delta_upper, na.rm = TRUE),
+  overall_flood_attribution_percent = sum(flood_periods_delta$attributable_cases_delta, na.rm = TRUE) / 
+    sum(flood_periods_delta$Y, na.rm = TRUE) * 100
+)
+
+# Save flood period overall statistics
+write.csv(flood_overall_stats_delta, file.path(output_dir, "flood_overall_statistics_delta.csv"), row.names = FALSE)
+
+#####################################
+## 11. Final Results Summary with Delta Method
+#####################################
+
+cat("\n========== Final Results Summary (Delta Method) ==========\n")
+
+# Total flood effect with confidence interval using Delta method
+total_effect_se <- sqrt(t(rep(1, length(flood_coefs_ordered))) %*% flood_vcov %*% rep(1, length(flood_coefs_ordered)))
+total_effect_lower <- total_flood_effect - 1.96 * total_effect_se
+total_effect_upper <- total_flood_effect + 1.96 * total_effect_se
+
+cat("洪水总效应 (95%CI):", round(total_flood_effect, 4), 
+    " (", round(total_effect_lower, 4), " - ", round(total_effect_upper, 4), ")\n")
+cat("相对风险:", round(exp(total_flood_effect), 3),
+    " (95%CI: ", round(exp(total_effect_lower), 3), " - ", round(exp(total_effect_upper), 3), ")\n")
+
+# Delta method flood period statistics
+overall_stats_delta <- flood_periods_delta[, .(
+  total_flood_observations = .N,
+  total_cases = sum(Y, na.rm = TRUE),
+  mean_paf = mean(paf_percent, na.rm = TRUE),
+  total_attributable = sum(attributable_cases_delta, na.rm = TRUE),
+  total_attributable_lower = sum(attributable_cases_delta_lower, na.rm = TRUE),
+  total_attributable_upper = sum(attributable_cases_delta_upper, na.rm = TRUE)
+)]
+
+cat("\nDelta方法洪水期间总体结果:\n")
+cat("洪水期间观测数:", overall_stats_delta$total_flood_observations, "\n")
+cat("总实际发病数:", overall_stats_delta$total_cases, "\n")
+cat("平均归因比例:", round(overall_stats_delta$mean_paf, 2), "%\n")
+cat("总归因发病数:", round(overall_stats_delta$total_attributable, 1),
+    " (95%CI: ", round(overall_stats_delta$total_attributable_lower, 1), " - ", 
+    round(overall_stats_delta$total_attributable_upper, 1), ")\n")
+
+# Overall PAF calculation
+overall_paf_delta <- overall_stats_delta$total_attributable / 
+  sum(flood_periods_delta$Y, na.rm = TRUE) * 100
+cat("总体PAF (Delta方法):", round(overall_paf_delta, 2), "%\n")
+
+cat("\n前10个城市结果 (Delta方法):\n")
+print(city_attribution_final[1:10, .(cityid, mean_paf_percent, mean_paf_lower, mean_paf_upper, 
+                                     total_attributable_cases, total_attributable_lower, total_attributable_upper)])
+
+cat("\n========== Analysis Complete ==========\n")
+cat("主要输出文件 (仅Delta方法):\n")
+cat("1. city_attribution_final.csv - 城市级Delta方法最终结果\n")
+cat("2. data_with_delta_ci.csv - 完整数据含Delta方法置信区间\n")
+cat("3. flood_periods_delta_ci.csv - 洪水期间Delta方法数据\n")
+cat("4. flood_week_attribution_delta.csv - 周级别Delta方法归因数据\n")
+cat("5. attribution_percent_delta_ci.png - 归因比例图 (Delta方法)\n")
+cat("6. attributable_cases_delta_ci.png - 归因发病数图 (Delta方法)\n")
+cat("7. flood_attribution_map_delta.png - 归因比例地图 (Delta方法)\n")
+cat("8. timeseries_attribution_delta.png - 时间序列图 (Delta方法)\n")
+
+cat("\nDelta方法优势:\n")
+cat("- 基于严格的统计推断理论\n")
+cat("- 考虑了模型参数的不确定性\n")
+cat("- 提供了置信区间来量化统计不确定性\n")
+cat("- 适用于多个参数线性组合的推断\n")
+cat("- 为政策制定提供更可靠的证据\n")
+
+cat("\n所有分析均基于Delta方法，提供统计学严格的置信区间\n")

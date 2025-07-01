@@ -1,0 +1,851 @@
+# Flood Attribution Analysis and Geographic Visualization for Malaria
+# Based on Poisson Fixed Effects Model (Model 2 with lag terms: Total flood effect analysis)
+# Corrected version: Proper use of population offset and population density
+
+# Load necessary packages
+library(fixest)       # For fixed effects models
+library(data.table)   # For efficient data processing
+library(readxl)       # For reading Excel files
+library(writexl)      # For writing Excel files
+library(dplyr)        # For data manipulation
+library(tidyr)        # For data reshaping
+library(ggplot2)      # For data visualization
+library(RColorBrewer) # For color schemes
+library(viridis)      # For better color schemes
+library(gridExtra)    # For combining multiple plots
+library(scales)       # For formatting legends
+library(sf)           # For spatial data processing
+
+# Try to load spatial analysis packages
+spatial_analysis_available <- require(spdep)
+if(!spatial_analysis_available) {
+  cat("Note: Spatial analysis package 'spdep' not installed, will skip spatial autocorrelation analysis.\n")
+}
+
+#####################################
+## 1. Data Preparation
+#####################################
+
+# Read data
+data <- read_excel("C:/Users/a1230/Desktop/nuejidata.xlsx")
+
+# Convert to data.table for improved processing efficiency
+setDT(data)
+
+# Check data structure
+cat("\nData structure overview:\n")
+str(data)
+
+# Verify ADM3 column exists
+if("ADM3" %in% colnames(data)) {
+  cat("\nFound ADM3 column, can be used for map matching\n")
+  id_col <- "ADM3"
+} else if("ADM3_PCODE" %in% colnames(data)) {
+  cat("\nFound ADM3_PCODE column, can be used for map matching\n")
+  id_col <- "ADM3_PCODE"
+} else {
+  cat("\nWarning: Map matching column (ADM3/ADM3_PCODE) not found, will use cityid as identifier\n")
+  id_col <- "cityid"
+}
+
+# Data preprocessing
+data[, year := as.integer(year)]
+data[, week := as.integer(week)]
+data[, cityid := as.factor(cityid)]
+data[, yearweek := paste0(year, "_", sprintf("%02d", week))]
+data[, yearweek := as.factor(yearweek)]
+
+# Ensure data is sorted by cityid and time (for creating lag variables)
+setorder(data, cityid, year, week)
+
+#####################################
+## 2. Create Lag Variables
+#####################################
+
+cat("\n======= Creating Flood Lag Variables =======\n")
+
+# Create lag variables for each city
+data[, flood_lag1 := shift(flood, 1), by = cityid]  # 1-week lag
+data[, flood_lag2 := shift(flood, 2), by = cityid]  # 2-week lag
+data[, flood_lag3 := shift(flood, 3), by = cityid]  # 3-week lag
+data[, flood_lag4 := shift(flood, 4), by = cityid]  # 4-week lag
+
+# Set NA values to 0 (for the first few weeks of data)
+flood_lag_vars <- c("flood_lag1", "flood_lag2", "flood_lag3", "flood_lag4")
+for(var in flood_lag_vars) {
+  data[is.na(get(var)), (var) := 0]
+}
+
+# Check lag variable creation
+cat("Flood variable statistics:\n")
+cat("Current flood (flood):", sum(data$flood), "weeks\n")
+cat("1-week lag (flood_lag1):", sum(data$flood_lag1), "weeks\n")
+cat("2-week lag (flood_lag2):", sum(data$flood_lag2), "weeks\n")
+cat("3-week lag (flood_lag3):", sum(data$flood_lag3), "weeks\n")
+cat("4-week lag (flood_lag4):", sum(data$flood_lag4), "weeks\n")
+
+# Temperature variables
+data[, temp_range := max - min]  # Temperature range
+data[, temperature_sq := temperature^2]  # Quadratic temperature term
+
+# Prepare population offset (using population variable)
+if ("population" %in% names(data)) {
+  data[, population := as.numeric(population)]
+  data[population <= 0 | is.na(population), population := 1]  # Avoid log(0) or NA
+  data[, log_population_offset := log(population)]
+  cat("\n✓ Created log_population_offset for population offset in model\n")
+  cat("Population data statistics:\n")
+  print(summary(data$population))
+  offset_available <- TRUE
+} else {
+  cat("\nWarning: No 'population' column in data, model will not use population offset.\n")
+  offset_available <- FALSE
+}
+
+# Prepare population density variable (as control variable)
+if ("population_density" %in% names(data)) {
+  data[, population_density := as.numeric(population_density)]
+  data[, log_population_density := log(population_density + 1)]
+  cat("\n✓ Created log_population_density for control variable in model\n")
+  cat("Population density data statistics:\n")
+  print(summary(data$population_density))
+  pop_density_available <- TRUE
+} else {
+  cat("\nWarning: No 'population_density' column in data.\n")
+  pop_density_available <- FALSE
+}
+
+# Check other socioeconomic variables
+if ("light_density" %in% names(data)) {
+  data[, light_density := as.numeric(light_density)]
+  data[, log_light_density := log(light_density + 1)]
+  cat("✓ Created log_light_density variable\n")
+  light_density_available <- TRUE
+} else {
+  cat("Warning: No 'light_density' column in data.\n")
+  light_density_available <- FALSE
+}
+
+if ("LandUse_10" %in% names(data)) {
+  data[, urban_index := LandUse_10]
+  cat("✓ Created urban_index variable\n")
+  urban_available <- TRUE
+} else {
+  cat("Warning: No 'LandUse_10' column in data.\n")
+  urban_available <- FALSE
+}
+
+# Check if all socioeconomic variables exist
+socioeconomic_vars_exist <- pop_density_available && light_density_available && urban_available
+
+if(socioeconomic_vars_exist) {
+  cat("\n✓ All socioeconomic variables prepared, will use complete Model 2\n")
+} else {
+  cat("\nWarning: Some socioeconomic variables missing, will build model with available variables\n")
+  # List missing variables
+  missing_vars <- c()
+  if(!pop_density_available) missing_vars <- c(missing_vars, "population_density")
+  if(!light_density_available) missing_vars <- c(missing_vars, "light_density")
+  if(!urban_available) missing_vars <- c(missing_vars, "LandUse_10")
+  cat("Missing variables:", paste(missing_vars, collapse=", "), "\n")
+}
+
+#####################################
+## 3. MODEL 2: Poisson Fixed Effects Model with Lag Terms
+#####################################
+
+cat("\n======= MODEL 2: Poisson Fixed Effects Model with Flood Lag Terms =======\n")
+
+# Build list of available control variables
+control_vars <- c("temperature", "temperature_sq", "temp_range",
+                  "pressure", "wind_speed", "relative_humidity", 
+                  "total_precipitation_sum")
+
+# Add flood lag terms
+flood_vars <- c("flood", "flood_lag1", "flood_lag2", "flood_lag3", "flood_lag4")
+cat("Flood variables (including lags):", paste(flood_vars, collapse = ", "), "\n")
+
+# Add available socioeconomic variables
+if(pop_density_available) {
+  control_vars <- c(control_vars, "log_population_density")
+  cat("✓ Including population density control variable\n")
+}
+if(light_density_available) {
+  control_vars <- c(control_vars, "log_light_density")
+  cat("✓ Including light density control variable\n")
+}
+if(urban_available) {
+  control_vars <- c(control_vars, "urban_index")
+  cat("✓ Including urbanization index control variable\n")
+}
+
+# Build model formula (including all flood lag terms)
+formula_str <- paste("Y ~", paste(flood_vars, collapse = " + "), "+", 
+                     paste(control_vars, collapse = " + "), "| cityid + yearweek")
+cat("\nModel formula:", formula_str, "\n")
+
+# Estimate model based on population offset availability
+if (offset_available) {
+  model2_lag <- fepois(as.formula(formula_str), 
+                       offset = ~log_population_offset,
+                       data = data)
+  cat("\n✓ Model includes population offset (log_population_offset)\n")
+  cat("   This means the model analyzes malaria incidence rates rather than absolute case counts\n")
+} else {
+  model2_lag <- fepois(as.formula(formula_str), data = data)
+  cat("\n⚠ Model does not include population offset, analyzes absolute case counts\n")
+}
+
+# Output model results
+cat("\nModel 2 (with lag terms) results summary:\n")
+print(summary(model2_lag))
+
+# Extract flood effect coefficients
+flood_coefs <- coef(model2_lag)[flood_vars]
+cat("\nFlood lag effect coefficients:\n")
+for(i in 1:length(flood_coefs)) {
+  cat(paste0(names(flood_coefs)[i], ": ", round(flood_coefs[i], 4), "\n"))
+}
+
+# Calculate total flood effect
+total_flood_effect <- sum(flood_coefs, na.rm = TRUE)
+cat("\nTotal flood effect (sum of all lag terms):", round(total_flood_effect, 4), "\n")
+
+if(offset_available) {
+  cat("Interpretation: When floods occur, the expected total change rate in malaria incidence is", 
+      round((exp(total_flood_effect) - 1) * 100, 2), "%\n")
+} else {
+  cat("Interpretation: When floods occur, the expected total change rate in malaria case count is", 
+      round((exp(total_flood_effect) - 1) * 100, 2), "%\n")
+}
+
+#####################################
+## 4. Attribution Analysis Function - Lag Effects Version
+#####################################
+
+# Create output directory
+output_dir <- "C:/Users/a1230/Desktop/pic"
+dir.create(output_dir, showWarnings = FALSE)
+
+# Corrected prediction function (considering all lag terms)
+predict_cases_lag <- function(model, newdata, reference = FALSE) {
+  # Create copy of data to avoid modifying original data
+  pred_data <- data.table::copy(newdata)
+  
+  # Get model formula
+  formula <- model$fml$linear
+  
+  # Get fixed effects and variables
+  fe_vars <- all.vars(model$fml$fixef)
+  all_vars <- all.vars(formula)
+  
+  # Extract coefficients
+  coefs <- coef(model)
+  
+  # If reference scenario, set all flood variables to 0 in the copy
+  if(reference) {
+    pred_data[, flood := 0]
+    pred_data[, flood_lag1 := 0]
+    pred_data[, flood_lag2 := 0]
+    pred_data[, flood_lag3 := 0]
+    pred_data[, flood_lag4 := 0]
+  }
+  
+  # Calculate linear prediction (excluding fixed effects)
+  linear_pred <- rep(0, nrow(pred_data))
+  for(var in names(coefs)) {
+    if(var %in% names(pred_data)) {
+      linear_pred <- linear_pred + coefs[var] * pred_data[[var]]
+    }
+  }
+  
+  # Get fixed effects estimates
+  if(!is.null(model$fixef)) {
+    # City fixed effects
+    if("cityid" %in% fe_vars && "cityid" %in% names(pred_data)) {
+      city_fe <- model$fixef$cityid[as.character(pred_data$cityid)]
+      city_fe[is.na(city_fe)] <- 0  # Handle missing values
+      linear_pred <- linear_pred + city_fe
+    }
+    
+    # Time fixed effects
+    if("yearweek" %in% fe_vars && "yearweek" %in% names(pred_data)) {
+      time_fe <- model$fixef$yearweek[as.character(pred_data$yearweek)]
+      time_fe[is.na(time_fe)] <- 0  # Handle missing values
+      linear_pred <- linear_pred + time_fe
+    }
+  }
+  
+  # If model has offset, add offset
+  if (offset_available && "log_population_offset" %in% names(pred_data)) {
+    linear_pred <- linear_pred + pred_data$log_population_offset
+    cat("✓ Population offset included in prediction\n")
+  }
+  
+  # Poisson model uses exp() transformation
+  predicted <- exp(linear_pred)
+  
+  return(predicted)
+}
+
+#####################################
+## 5. City-level Lag Attribution Analysis
+#####################################
+
+cat("\n======= Starting Lag Effect Attribution Analysis =======\n")
+
+# Calculate predicted values under observed scenario (including all lag effects)
+cat("Calculating predicted values under observed scenario (including lag effects)...\n")
+data$Y_pred_obs_lag <- predict_cases_lag(model2_lag, data)
+
+# Calculate predicted values under reference scenario (all flood lag terms = 0)
+cat("Calculating predicted values under reference scenario (no flood lag effects)...\n")
+data$Y_pred_ref_lag <- predict_cases_lag(model2_lag, data, reference = TRUE)
+
+# Calculate attributable disease burden (total lag effect)
+data$attributable_cases_lag <- data$Y_pred_obs_lag - data$Y_pred_ref_lag
+
+# Calculate attribution fraction (PAF) - using formula: PAF = (Y_pred_obs - Y_pred_ref) / Y_pred_obs
+data$attribution_share_lag <- data$attributable_cases_lag / data$Y_pred_obs_lag
+
+# Handle possible extreme values (negative or greater than 1)
+data$attribution_share_lag <- pmin(pmax(data$attribution_share_lag, 0), 1)
+
+# Convert attribution fraction to percentage
+data$attribution_percent_lag <- data$attribution_share_lag * 100
+
+# Identify flood periods (current or any lag period has flood)
+data[, any_flood := pmax(flood, flood_lag1, flood_lag2, flood_lag3, flood_lag4, na.rm = TRUE)]
+
+#####################################
+## 6. Analyze Attribution Fraction for Flood Periods Only
+#####################################
+
+cat("\n======= Analyzing Attribution Fraction for Flood Periods =======\n")
+
+# Filter data for flood periods
+flood_periods <- data[any_flood > 0]
+
+cat("Total flood period observations:", nrow(flood_periods), "\n")
+cat("Proportion of total observations:", round(nrow(flood_periods)/nrow(data)*100, 2), "%\n")
+
+# Aggregate flood period attribution data by city
+flood_city_attribution <- flood_periods %>%
+  group_by(cityid) %>%
+  summarise(
+    # Ensure ADM3 column is retained (if exists)
+    ADM3 = first(get(id_col)),
+    
+    # Flood period statistics
+    flood_weeks = n(),
+    total_flood_cases = sum(Y, na.rm = TRUE),
+    
+    # Lag attribution analysis
+    avg_attributable_cases_lag = mean(attributable_cases_lag, na.rm = TRUE),
+    total_attributable_cases_lag = sum(attributable_cases_lag, na.rm = TRUE),
+    
+    # Flood period attribution fraction
+    avg_attribution_percent_lag = mean(attribution_percent_lag, na.rm = TRUE),
+    median_attribution_percent_lag = median(attribution_percent_lag, na.rm = TRUE),
+    
+    # Attribution fraction confidence intervals
+    attribution_percent_lower = quantile(attribution_percent_lag, 0.025, na.rm = TRUE),
+    attribution_percent_upper = quantile(attribution_percent_lag, 0.975, na.rm = TRUE),
+    
+    # Population statistics (if available)
+    avg_population = if ("population" %in% names(data)) mean(population, na.rm = TRUE) else NA,
+    
+    # Flood intensity statistics
+    avg_flood_intensity = mean(any_flood, na.rm = TRUE),
+    max_flood_intensity = max(any_flood, na.rm = TRUE),
+    
+    .groups = 'drop'
+  ) %>%
+  arrange(desc(avg_attribution_percent_lag))  # Sort by average attribution fraction from high to low
+
+# Calculate week-level attribution data for flood periods
+flood_week_attribution <- flood_periods %>%
+  group_by(cityid, year, week) %>%
+  summarise(
+    actual_cases = sum(Y, na.rm = TRUE),
+    pred_obs_cases_lag = sum(Y_pred_obs_lag, na.rm = TRUE),
+    pred_ref_cases_lag = sum(Y_pred_ref_lag, na.rm = TRUE),
+    attributable_cases_lag = sum(attributable_cases_lag, na.rm = TRUE),
+    attribution_percent_lag = mean(attribution_percent_lag, na.rm = TRUE),
+    flood_intensity = mean(any_flood, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Save flood period attribution results
+write.csv(flood_city_attribution, file.path(output_dir, "flood_periods_city_attribution_lag.csv"), row.names = FALSE)
+write.csv(flood_week_attribution, file.path(output_dir, "flood_periods_week_attribution_lag.csv"), row.names = FALSE)
+
+#####################################
+## 7. Flood Period Attribution Fraction Visualization
+#####################################
+
+# 1. Flood period city attribution fraction bar chart (top 20 cities)
+subtitle_text <- paste0("Based on lag effect model, showing flood period data only", 
+                        ifelse(offset_available, " (population offset considered)", " (no population offset)"))
+
+flood_top_cities_plot <- ggplot(flood_city_attribution[1:min(20, nrow(flood_city_attribution)),], 
+                                aes(x = reorder(cityid, avg_attribution_percent_lag), 
+                                    y = avg_attribution_percent_lag)) +
+  geom_bar(stat = "identity", fill = "#e31a1c", alpha = 0.8) +
+  geom_errorbar(aes(ymin = attribution_percent_lower, ymax = attribution_percent_upper), 
+                width = 0.2) +
+  labs(title = "Proportion of Malaria Burden Attributable to Flood Lag Effects by City During Flood Periods (Top 20 Cities)",
+       subtitle = subtitle_text,
+       x = "City ID",
+       y = "Flood Period Attribution Fraction (%)") +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 8),
+    plot.title = element_text(size = 12, face = "bold"),
+    plot.subtitle = element_text(size = 10)
+  )
+
+# Save plot
+ggsave(file.path(output_dir, "flood_periods_top_cities_attribution_lag.png"), 
+       flood_top_cities_plot, width = 12, height = 8, dpi = 300)
+
+# 2. Scatter plot of flood intensity vs attribution fraction (flood periods only)
+flood_intensity_plot <- ggplot(flood_periods, 
+                               aes(x = any_flood, y = attribution_percent_lag)) +
+  geom_point(alpha = 0.6, color = "#e31a1c") +
+  geom_smooth(method = "loess", se = TRUE, color = "darkred") +
+  labs(title = "Flood Periods: Relationship between Flood Intensity and Malaria Attribution Fraction",
+       subtitle = subtitle_text,
+       x = "Flood Intensity",
+       y = "Attribution Fraction (%)") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 12, face = "bold"),
+    plot.subtitle = element_text(size = 10)
+  )
+
+ggsave(file.path(output_dir, "flood_periods_intensity_vs_attribution_lag.png"), 
+       flood_intensity_plot, width = 10, height = 7, dpi = 300)
+
+# 3. Box plot of flood period attribution fractions (grouped by city, showing top 15 cities)
+top_15_cities <- flood_city_attribution$cityid[1:min(15, nrow(flood_city_attribution))]
+flood_periods_top15 <- flood_periods[cityid %in% top_15_cities]
+
+flood_boxplot <- ggplot(flood_periods_top15, 
+                        aes(x = factor(cityid, levels = top_15_cities), 
+                            y = attribution_percent_lag)) +
+  geom_boxplot(fill = "#e31a1c", alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.4, size = 0.8) +
+  labs(title = "Distribution of Attribution Fractions by City During Flood Periods (Top 15 Cities)",
+       subtitle = subtitle_text,
+       x = "City ID",
+       y = "Attribution Fraction (%)") +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 8),
+    plot.title = element_text(size = 12, face = "bold"),
+    plot.subtitle = element_text(size = 10)
+  )
+
+ggsave(file.path(output_dir, "flood_periods_attribution_boxplot_lag.png"), 
+       flood_boxplot, width = 12, height = 8, dpi = 300)
+
+# 4. Time series plot: showing changes in attribution fraction during flood periods
+if(nrow(flood_week_attribution) > 0) {
+  # Select top 5 cities with most flood weeks for time series display
+  top_flood_cities <- flood_city_attribution %>%
+    arrange(desc(flood_weeks)) %>%
+    slice_head(n = 5) %>%
+    pull(cityid)
+  
+  flood_time_series_data <- flood_week_attribution %>%
+    filter(cityid %in% top_flood_cities) %>%
+    mutate(date = as.Date(paste(year, (week-1)*7 + 1, sep = "-"), format = "%Y-%j"))
+  
+  flood_timeseries_plot <- ggplot(flood_time_series_data, 
+                                  aes(x = date, y = attribution_percent_lag, color = cityid)) +
+    geom_line(size = 1, alpha = 0.8) +
+    geom_point(size = 2, alpha = 0.8) +
+    facet_wrap(~cityid, scales = "free_x", ncol = 2) +
+    labs(title = "Temporal Trends of Attribution Fractions During Flood Periods (Top 5 Cities with Most Floods)",
+         subtitle = subtitle_text,
+         x = "Time",
+         y = "Attribution Fraction (%)",
+         color = "City ID") +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      plot.title = element_text(size = 12, face = "bold"),
+      plot.subtitle = element_text(size = 10),
+      legend.position = "none"  # Already have facet labels, no need for legend
+    )
+  
+  ggsave(file.path(output_dir, "flood_periods_timeseries_attribution_lag.png"), 
+         flood_timeseries_plot, width = 12, height = 8, dpi = 300)
+}
+
+#####################################
+## 8. Map Visualization (Flood Period Data Only)
+#####################################
+
+# Read shapefile map data
+map_path <- "D:/秘鲁/秘鲁/地图三级行政区/per_admbnda_adm3_ign_20200714.shp"
+
+tryCatch({
+  map_data <- st_read(map_path, quiet = TRUE)
+  cat("\nSuccessfully read map data containing", nrow(map_data), "administrative regions\n")
+  
+  # Check shapefile structure
+  map_cols <- colnames(map_data)
+  cat("Map data contains the following fields:", paste(head(map_cols, 10), collapse=", "), 
+      ifelse(length(map_cols) > 10, "...", ""), "\n")
+  
+  # Determine matching field
+  if("ADM3_PCODE" %in% map_cols) {
+    map_id_field <- "ADM3_PCODE"
+    cat("Will use ADM3_PCODE field for matching\n")
+  } else {
+    cat("Warning: ADM3_PCODE field missing in map data, please check if the following available fields can be used for matching:\n")
+    print(grep("ADM|ID|CODE", map_cols, value = TRUE))
+    map_id_field <- map_cols[1]  # Default to first field, but may need manual adjustment
+    cat("Defaulting to", map_id_field, "field for matching, please manually modify code if incorrect\n")
+  }
+  
+  # Prepare attribution data for map matching
+  attribution_for_map <- flood_city_attribution %>%
+    mutate(!!map_id_field := ADM3)  # Ensure matching field exists
+  
+  # Merge map data and attribution data
+  map_with_attribution <- map_data %>%
+    left_join(attribution_for_map, by = map_id_field)
+  
+  # Check matching results
+  matched_regions <- sum(!is.na(map_with_attribution$avg_attribution_percent_lag))
+  total_regions <- nrow(map_with_attribution)
+  match_rate <- matched_regions / total_regions * 100
+  
+  cat("\nMap matching results: Successfully matched", matched_regions, "/", total_regions, 
+      "regions (", round(match_rate, 1), "%)\n")
+  
+  if(match_rate < 50) {
+    cat("Warning: Match rate below 50%, may need to check if ID fields correspond correctly\n")
+  }
+  
+  # Flood period attribution fraction map
+  subtitle_text_map <- paste0("Based on lag effect model, showing flood period data only", 
+                              ifelse(offset_available, " (population offset considered)", " (no population offset)"))
+  
+  flood_attribution_map <- ggplot(map_with_attribution) +
+    geom_sf(aes(fill = avg_attribution_percent_lag), color = "white", size = 0.1) +
+    scale_fill_viridis(
+      option = "plasma",
+      name = "Flood Period\nAttribution\nFraction (%)",
+      na.value = "grey80",
+      guide = guide_colorbar(
+        barwidth = 15, barheight = 0.5,
+        title.position = "top"
+      )
+    ) +
+    labs(
+      title = "Proportion of Malaria Burden Attributable to Flood Lag Effects by Region During Flood Periods",
+      subtitle = subtitle_text_map
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5),
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    )
+  
+  # Flood frequency map
+  flood_frequency_map <- ggplot(map_with_attribution) +
+    geom_sf(aes(fill = flood_weeks), color = "white", size = 0.1) +
+    scale_fill_viridis(
+      option = "viridis",
+      name = "Flood Weeks",
+      na.value = "grey80",
+      guide = guide_colorbar(
+        barwidth = 15, barheight = 0.5,
+        title.position = "top"
+      )
+    ) +
+    labs(
+      title = "Number of Flood Weeks by Region",
+      subtitle = "Flood event frequency during study period"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5),
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    )
+  
+  # Save map visualization results
+  ggsave(file.path(output_dir, "flood_periods_attribution_map_lag.png"), 
+         flood_attribution_map, width = 12, height = 10, dpi = 300)
+  ggsave(file.path(output_dir, "flood_frequency_map.png"), 
+         flood_frequency_map, width = 12, height = 10, dpi = 300)
+  
+  # Create combined map
+  combined_flood_maps <- grid.arrange(
+    flood_attribution_map, flood_frequency_map,
+    ncol = 1, nrow = 2,
+    top = grid::textGrob("Flood Lag Effect Attribution Analysis Geographic Visualization", 
+                         gp = grid::gpar(fontsize = 16, font = 2))
+  )
+  
+  # Save combined map
+  ggsave(file.path(output_dir, "combined_flood_attribution_maps_lag.png"), 
+         combined_flood_maps, width = 12, height = 16, dpi = 300)
+  
+}, error = function(e) {
+  cat("\nError reading map data:", e$message, "\n")
+  cat("Will skip map visualization section\n")
+})
+
+#####################################
+## 9. Summary Report
+#####################################
+
+# Calculate global attribution fraction for flood periods
+flood_global_attribution <- data.frame(
+  # Weighted by flood weeks
+  weighted_by_flood_weeks = weighted.mean(flood_city_attribution$avg_attribution_percent_lag, 
+                                          w = flood_city_attribution$flood_weeks, na.rm = TRUE),
+  # Weighted by flood period case count
+  weighted_by_flood_cases = weighted.mean(flood_city_attribution$avg_attribution_percent_lag, 
+                                          w = flood_city_attribution$total_flood_cases, na.rm = TRUE),
+  # Unweighted average
+  unweighted = mean(flood_city_attribution$avg_attribution_percent_lag, na.rm = TRUE)
+)
+
+# Save flood period global attribution results
+write.csv(flood_global_attribution, file.path(output_dir, "flood_periods_global_attribution_lag.csv"), row.names = FALSE)
+
+# Calculate flood period overall statistics
+flood_overall_stats <- data.frame(
+  total_observations = nrow(data),
+  flood_period_observations = nrow(flood_periods),
+  flood_occurrence_rate = nrow(flood_periods) / nrow(data) * 100,
+  total_cities_with_floods = length(unique(flood_periods$cityid)),
+  total_flood_cases = sum(flood_periods$Y, na.rm = TRUE),
+  total_attributable_cases_lag = sum(flood_periods$attributable_cases_lag, na.rm = TRUE),
+  overall_flood_attribution_percent = sum(flood_periods$attributable_cases_lag, na.rm = TRUE) / 
+    sum(flood_periods$Y_pred_obs_lag, na.rm = TRUE) * 100
+)
+
+# Save flood period overall statistics
+write.csv(flood_overall_stats, file.path(output_dir, "flood_periods_overall_statistics_lag.csv"), row.names = FALSE)
+
+cat("\n========== Flood Lag Effect Attribution Analysis Complete ==========\n")
+cat("\nLag model coefficient summary:\n")
+for(i in 1:length(flood_coefs)) {
+  cat(paste0(names(flood_coefs)[i], ": ", round(flood_coefs[i], 4), 
+             " (relative risk: ", round(exp(flood_coefs[i]), 3), ")\n"))
+}
+
+cat("\nTotal flood effect:", round(total_flood_effect, 4))
+cat("  (total relative risk: ", round(exp(total_flood_effect), 3), ")\n")
+
+if(offset_available) {
+  cat("Interpretation: Considering lag effects, the total impact of floods on malaria incidence rate is", 
+      round((exp(total_flood_effect) - 1) * 100, 2), "% increase\n")
+} else {
+  cat("Interpretation: Considering lag effects, the total impact of floods on malaria case count is", 
+      round((exp(total_flood_effect) - 1) * 100, 2), "% increase\n")
+}
+
+cat("\nFlood period attribution fraction (weighted average):", round(flood_global_attribution$weighted_by_flood_cases, 2), "%\n")
+cat("Total malaria cases during flood periods:", flood_overall_stats$total_flood_cases, "\n")
+cat("Estimated cases attributable to flood lag effects:", round(flood_overall_stats$total_attributable_cases_lag, 0), "\n")
+cat("Flood occurrence rate in data:", round(flood_overall_stats$flood_occurrence_rate, 2), "%\n")
+
+cat("\nTop 5 cities with highest flood period attribution fractions:\n")
+print(head(flood_city_attribution[, c("cityid", "avg_attribution_percent_lag", "flood_weeks", "total_flood_cases")], 5))
+
+cat("\nAll flood period analysis results and charts saved to directory:", output_dir, "\n")
+
+# Output variable usage summary
+cat("\n========== Lag Effect Model Variable Usage Summary ==========\n")
+cat("Flood lag terms:", paste(flood_vars, collapse = ", "), "\n")
+cat("Population offset (offset):", ifelse(offset_available, "✓ population → log_population_offset", "✗ Not used"), "\n")
+cat("Population density control variable:", ifelse(pop_density_available, "✓ population_density → log_population_density", "✗ Not used"), "\n")
+cat("Light density control variable:", ifelse(light_density_available, "✓ light_density → log_light_density", "✗ Not used"), "\n")
+cat("Urbanization index control variable:", ifelse(urban_available, "✓ LandUse_10 → urban_index", "✗ Not used"), "\n")
+
+cat("\n========== Analysis Complete ==========\n")
+
+#####################################
+## Create Comprehensive Flood Status and Attribution Analysis Table
+#####################################
+
+cat("\n======= Creating Comprehensive Analysis Table =======\n")
+
+# Create flood status vector
+data[, flood_status_vector := paste(flood, flood_lag1, flood_lag2, flood_lag3, flood_lag4, sep = " ")]
+
+# Sort by city and time
+setorder(data, cityid, year, week)
+
+# Create comprehensive table with all key information
+comprehensive_table <- data[, .(
+  # Basic identification information
+  cityid,
+  ADM3 = get(id_col),
+  year, 
+  week,
+  time_id = paste0(year, "_W", sprintf("%02d", week)),
+  
+  # Malaria case information
+  malaria_cases = Y,
+  
+  # Flood status information (current and lag periods)
+  current_flood = flood,
+  lag1_flood = flood_lag1,
+  lag2_flood = flood_lag2, 
+  lag3_flood = flood_lag3,
+  lag4_flood = flood_lag4,
+  
+  # Flood status vector "0 0 0 0 0" format
+  flood_status_vector,
+  
+  # Whether any flood impact exists
+  any_flood_period = any_flood,
+  
+  # Attribution analysis results (if calculated)
+  predicted_cases_with_flood = if("Y_pred_obs_lag" %in% names(data)) Y_pred_obs_lag else NA,
+  predicted_cases_no_flood = if("Y_pred_ref_lag" %in% names(data)) Y_pred_ref_lag else NA,
+  attributable_cases = if("attributable_cases_lag" %in% names(data)) attributable_cases_lag else NA,
+  attribution_percent = if("attribution_percent_lag" %in% names(data)) round(attribution_percent_lag, 2) else NA,
+  
+  # Meteorological conditions
+  temperature,
+  precipitation = total_precipitation_sum,
+  humidity = relative_humidity,
+  
+  # Population information (if available)
+  population = if("population" %in% names(data)) population else NA,
+  population_density = if("population_density" %in% names(data)) population_density else NA
+)]
+
+# Add flood status description
+comprehensive_table[, flood_status_description := case_when(
+  flood_status_vector == "0 0 0 0 0" ~ "No flood",
+  flood_status_vector == "1 0 0 0 0" ~ "Current flood only",
+  flood_status_vector == "0 1 0 0 0" ~ "1-week lag flood only",
+  flood_status_vector == "0 0 1 0 0" ~ "2-week lag flood only",
+  flood_status_vector == "0 0 0 1 0" ~ "3-week lag flood only",
+  flood_status_vector == "0 0 0 0 1" ~ "4-week lag flood only",
+  TRUE ~ "Multi-period flood"
+)]
+
+# Save comprehensive table
+write.csv(comprehensive_table, file.path(output_dir, "comprehensive_flood_malaria_analysis.csv"), row.names = FALSE)
+
+cat("✓ Comprehensive analysis table saved to: comprehensive_flood_malaria_analysis.csv\n")
+
+#####################################
+## Output Records with Flood Impact Only
+#####################################
+
+# Filter weeks with flood impact
+flood_impact_records <- comprehensive_table[any_flood_period > 0]
+
+# Sort by attribution fraction from high to low (if attribution data exists)
+if("attribution_percent" %in% names(flood_impact_records) && !all(is.na(flood_impact_records$attribution_percent))) {
+  setorder(flood_impact_records, -attribution_percent)
+}
+
+# Save records with flood impact
+write.csv(flood_impact_records, file.path(output_dir, "flood_impact_records_only.csv"), row.names = FALSE)
+
+cat("✓ Flood impact records saved to: flood_impact_records_only.csv\n")
+
+#####################################
+## Data Overview and Statistics
+#####################################
+
+cat("\n========== Comprehensive Table Data Overview ==========\n")
+cat("Total records:", nrow(comprehensive_table), "\n")
+cat("Number of cities involved:", length(unique(comprehensive_table$cityid)), "\n")
+cat("Time span:", min(comprehensive_table$year), "-", max(comprehensive_table$year), "\n")
+cat("Records with flood impact:", nrow(flood_impact_records), "\n")
+cat("Flood impact proportion:", round(nrow(flood_impact_records)/nrow(comprehensive_table)*100, 2), "%\n")
+
+# Flood status statistics
+cat("\nFlood status vector frequency statistics:\n")
+flood_pattern_stats <- table(comprehensive_table$flood_status_vector)
+print(head(sort(flood_pattern_stats, decreasing = TRUE), 10))
+
+# Flood status description statistics
+cat("\nFlood status description statistics:\n")
+print(table(comprehensive_table$flood_status_description))
+
+# If attribution data exists, show attribution statistics
+if("attribution_percent" %in% names(comprehensive_table) && !all(is.na(comprehensive_table$attribution_percent))) {
+  cat("\nFlood period attribution fraction statistics:\n")
+  attribution_stats <- flood_impact_records[!is.na(attribution_percent), .(
+    record_count = .N,
+    mean_attribution_percent = round(mean(attribution_percent), 2),
+    median_attribution_percent = round(median(attribution_percent), 2),
+    min_attribution_percent = round(min(attribution_percent), 2),
+    max_attribution_percent = round(max(attribution_percent), 2)
+  )]
+  print(attribution_stats)
+}
+
+# Summarize flood conditions by city
+cat("\nFlood condition summary by city (top 10 cities):\n")
+city_summary <- comprehensive_table[, .(
+  total_weeks = .N,
+  flood_weeks = sum(any_flood_period > 0),
+  flood_percentage = round(sum(any_flood_period > 0) / .N * 100, 1),
+  total_cases = sum(malaria_cases, na.rm = TRUE),
+  flood_period_cases = sum(malaria_cases[any_flood_period > 0], na.rm = TRUE),
+  avg_attribution_percent = if("attribution_percent" %in% names(comprehensive_table)) {
+    round(mean(attribution_percent[any_flood_period > 0], na.rm = TRUE), 2)
+  } else NA
+), by = .(cityid)] %>%
+  arrange(desc(flood_weeks))
+
+print(head(city_summary, 10))
+
+#####################################
+## Show Example Records
+#####################################
+
+cat("\n========== Data Examples ==========\n")
+cat("First 10 records of comprehensive table:\n")
+example_cols <- c("cityid", "year", "week", "malaria_cases", "flood_status_vector", 
+                  "flood_status_description", "attribution_percent")
+available_cols <- example_cols[example_cols %in% names(comprehensive_table)]
+print(head(comprehensive_table[, ..available_cols], 10))
+
+if(nrow(flood_impact_records) > 0) {
+  cat("\nFirst 10 records of flood impact periods:\n")
+  print(head(flood_impact_records[, ..available_cols], 10))
+  
+  cat("\nTop 10 records with highest attribution fractions:\n")
+  if("attribution_percent" %in% names(flood_impact_records) && !all(is.na(flood_impact_records$attribution_percent))) {
+    top_attribution <- flood_impact_records[!is.na(attribution_percent)][1:min(10, .N)]
+    print(top_attribution[, ..available_cols])
+  }
+}
+
+cat("\n========== Comprehensive Table Creation Complete ==========\n")
+cat("Main output files:\n")
+cat("1. comprehensive_flood_malaria_analysis.csv - Complete comprehensive analysis table\n")
+cat("2. flood_impact_records_only.csv - Records with flood impact periods only\n")
+cat("\nTable contains the following key information:\n")
+cat("- City and time identifiers\n")
+cat("- Malaria case counts\n")
+cat("- Flood status vector (format: '0 0 0 0 0')\n")
+cat("- Flood status description\n")
+cat("- Attribution analysis results\n")
+cat("- Meteorological and population data\n")

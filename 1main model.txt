@@ -1,0 +1,321 @@
+# Enhanced Models for Malaria Analysis with Flood Lag Effects
+# Using Poisson Fixed Effects models with logical model progression
+# With NA values handled appropriately and proper population offset
+
+# Load necessary packages
+library(fixest)       # For fixed effects models
+library(data.table)   # For efficient data manipulation
+library(readxl)       # For reading Excel files
+library(writexl)      # For writing Excel files
+library(broom)        # For tidy model outputs
+library(car)          # For VIF calculations
+
+# Read data
+data <- read_excel("C:/Users/DELL/Desktop/nuejidata.xlsx")
+
+# Convert to data.table for efficient manipulation
+setDT(data)
+
+# Data preprocessing
+data[, year := as.integer(year)]
+data[, week := as.integer(week)]
+data[, cityid := as.factor(cityid)]
+data[, yearweek := paste0(year, "_", sprintf("%02d", week))]
+data[, yearweek := as.factor(yearweek)]
+
+# Temperature variables
+data[, temp_range := max - min]  # Temperature range
+data[, temperature_sq := temperature^2]  # Quadratic temperature term
+
+# Create lagged variables for flood
+for(i in 1:4) {
+  # Create lagged variables
+  data[, paste0("flood_lag", i) := shift(flood, i, type = "lag"), by = cityid]
+  data[, paste0("floodday_lag", i) := shift(floodday, i, type = "lag"), by = cityid]
+  
+  # Replace NA values with 0 as per your instructions
+  data[is.na(get(paste0("flood_lag", i))), (paste0("flood_lag", i)) := 0]
+  data[is.na(get(paste0("floodday_lag", i))), (paste0("floodday_lag", i)) := 0]
+}
+
+# Process population variable for offset (每个城市每年的人口数量)
+if ("population" %in% names(data)) {
+  data[, population := as.numeric(population)]
+  # Handle zero or negative population values
+  data[population <= 0 | is.na(population), population := 1]  # Avoid log(0) or log(NA)
+  data[, log_population_offset := log(population)]
+  cat("Created log_population_offset for use as exposure term in models\n")
+  cat("Population statistics:\n")
+  print(summary(data$population))
+  offset_available <- TRUE
+} else {
+  cat("WARNING: No 'population' column found. Models will use count data without population offset.\n")
+  offset_available <- FALSE
+}
+
+# Process population density variable
+if ("population_density" %in% names(data)) {
+  data[, population_density := as.numeric(population_density)]
+  data[, log_population_density := log(population_density + 1)]
+  cat("Created log_population_density variable\n")
+  cat("Population density statistics:\n")
+  print(summary(data$population_density))
+  pop_density_available <- TRUE
+} else {
+  cat("WARNING: No 'population_density' column found.\n")
+  pop_density_available <- FALSE
+}
+
+# Check for other socioeconomic variables and transform them
+if ("light_density" %in% names(data)) {
+  data[, log_light_density := log(light_density + 1)]
+  light_density_available <- TRUE
+} else {
+  light_density_available <- FALSE
+  cat("WARNING: No 'light_density' column found.\n")
+}
+
+if ("LandUse_10" %in% names(data)) {
+  data[, urban_index := LandUse_10]
+  urban_available <- TRUE
+} else {
+  urban_available <- FALSE
+  cat("WARNING: No 'LandUse_10' column found.\n")
+}
+
+# Check availability of socioeconomic variables
+socioeconomic_vars_exist <- pop_density_available && light_density_available && urban_available
+
+# Create a list to store all models and their results
+all_models <- list()
+
+###############################################
+# MODEL 1: Main model without lags or socioeconomic variables
+###############################################
+cat("\n======= MODEL 1: Basic Weather Model (Poisson) with Population Offset =======\n")
+
+# Determine whether to include offset term based on availability
+if (offset_available) {
+  model1 <- fepois(Y ~ flood + temperature + temp_range +
+                     pressure + wind_speed + relative_humidity + 
+                     total_precipitation_sum + temperature_sq | 
+                     cityid + yearweek, 
+                   offset = ~log_population_offset,
+                   data = data)
+} else {
+  model1 <- fepois(Y ~ flood + temperature + temp_range +
+                     pressure + wind_speed + relative_humidity + 
+                     total_precipitation_sum + temperature_sq | 
+                     cityid + yearweek, 
+                   data = data)
+}
+
+# Output for Model 1
+cat("\nModel 1 Results:\n")
+print(summary(model1))
+all_models[["model1"]] <- model1
+
+##############################################################
+# MODEL 2: Model 1 + socioeconomic controls (including population density)
+##############################################################
+if (socioeconomic_vars_exist) {
+  cat("\n======= MODEL 2: Model 1 + Socioeconomic Controls (Poisson) =======\n")
+  
+  if (offset_available) {
+    model2 <- fepois(Y ~ flood + temperature + temperature_sq + temp_range +
+                       pressure + wind_speed + relative_humidity + 
+                       total_precipitation_sum + log_population_density + 
+                       log_light_density + urban_index | 
+                       cityid + yearweek,
+                     offset = ~log_population_offset,
+                     data = data)
+  } else {
+    model2 <- fepois(Y ~ flood + temperature + temperature_sq + temp_range +
+                       pressure + wind_speed + relative_humidity + 
+                       total_precipitation_sum + log_population_density + 
+                       log_light_density + urban_index | 
+                       cityid + yearweek,
+                     data = data)
+  }
+  
+  # Output for Model 2
+  cat("\nModel 2 Results:\n")
+  print(summary(model2))
+  all_models[["model2"]] <- model2
+} else {
+  cat("\n======= MODEL 2: Skipped due to missing socioeconomic variables =======\n")
+  if (!pop_density_available) cat("Missing: population_density\n")
+  if (!light_density_available) cat("Missing: light_density\n")
+  if (!urban_available) cat("Missing: LandUse_10\n")
+}
+
+##############################################################
+# MODEL 3: Model 2 + flood lag effects (building upon previous model)
+##############################################################
+if (socioeconomic_vars_exist) {
+  cat("\n======= MODEL 3: Model 2 + Flood Lag Effects (Poisson) =======\n")
+  
+  if (offset_available) {
+    model3 <- fepois(Y ~ flood + temperature + temperature_sq + temp_range +
+                       pressure + wind_speed + relative_humidity + 
+                       total_precipitation_sum + log_population_density + 
+                       log_light_density + urban_index +
+                       flood_lag1 + flood_lag2 + flood_lag3 + flood_lag4 | 
+                       cityid + yearweek,
+                     offset = ~log_population_offset,
+                     data = data)
+  } else {
+    model3 <- fepois(Y ~ flood + temperature + temperature_sq + temp_range +
+                       pressure + wind_speed + relative_humidity + 
+                       total_precipitation_sum + log_population_density + 
+                       log_light_density + urban_index +
+                       flood_lag1 + flood_lag2 + flood_lag3 + flood_lag4 | 
+                       cityid + yearweek,
+                     data = data)
+  }
+  
+  # Output for Model 3
+  cat("\nModel 3 Results:\n")
+  print(summary(model3))
+  all_models[["model3"]] <- model3
+} else {
+  cat("\n======= MODEL 3: Skipped due to missing socioeconomic variables =======\n")
+}
+
+##############################################################
+# MODEL 4: Using floodday instead of flood with socioeconomic controls
+##############################################################
+if (socioeconomic_vars_exist) {
+  cat("\n======= MODEL 4: Model with floodday (Poisson) =======\n")
+  
+  if (offset_available) {
+    model4 <- fepois(Y ~ floodday + temperature + temperature_sq + temp_range +
+                       pressure + wind_speed + relative_humidity + 
+                       total_precipitation_sum + log_population_density + 
+                       log_light_density + urban_index | 
+                       cityid + yearweek,
+                     offset = ~log_population_offset,
+                     data = data)
+  } else {
+    model4 <- fepois(Y ~ floodday + temperature + temperature_sq + temp_range +
+                       pressure + wind_speed + relative_humidity + 
+                       total_precipitation_sum + log_population_density + 
+                       log_light_density + urban_index | 
+                       cityid + yearweek,
+                     data = data)
+  }
+  
+  # Output for Model 4
+  cat("\nModel 4 Results:\n")
+  print(summary(model4))
+  all_models[["model4"]] <- model4
+} else {
+  cat("\n======= MODEL 4: Skipped due to missing socioeconomic variables =======\n")
+}
+
+##############################################################
+# MODEL 5: Using floodday with lag effects (comprehensive model)
+##############################################################
+if (socioeconomic_vars_exist) {
+  cat("\n======= MODEL 5: Floodday with Lag Effects (Poisson) =======\n")
+  
+  if (offset_available) {
+    model5 <- fepois(Y ~ floodday + temperature + temperature_sq + temp_range +
+                       pressure + wind_speed + relative_humidity + 
+                       total_precipitation_sum + log_population_density + 
+                       log_light_density + urban_index +
+                       floodday_lag1 + floodday_lag2 + floodday_lag3 + floodday_lag4 | 
+                       cityid + yearweek,
+                     offset = ~log_population_offset,
+                     data = data)
+  } else {
+    model5 <- fepois(Y ~ floodday + temperature + temperature_sq + temp_range +
+                       pressure + wind_speed + relative_humidity + 
+                       total_precipitation_sum + log_population_density + 
+                       log_light_density + urban_index +
+                       floodday_lag1 + floodday_lag2 + floodday_lag3 + floodday_lag4 | 
+                       cityid + yearweek,
+                     data = data)
+  }
+  
+  # Output for Model 5
+  cat("\nModel 5 Results:\n")
+  print(summary(model5))
+  all_models[["model5"]] <- model5
+} else {
+  cat("\n======= MODEL 5: Skipped due to missing socioeconomic variables =======\n")
+}
+
+##############################################################
+# MODEL COMPARISON
+##############################################################
+cat("\n======= MODEL COMPARISON TABLE =======\n")
+
+# Create comparison table with all available models
+available_models <- all_models[lengths(all_models) > 0]
+
+if (length(available_models) > 1) {
+  # Create comparison table
+  comparison_table <- do.call(etable, c(available_models, 
+                                        list(title = "Poisson Fixed Effects Model Results: Floods, Temperature and Malaria",
+                                             digits = 4,
+                                             se.below = TRUE)))
+  
+  # Display the comparison table
+  print(comparison_table)
+  
+  # Export the comparison table to Excel
+  excel_file <- "C:/Users/DELL/Desktop/malaria_model_comparison.xlsx"
+  
+  # Convert comparison table to data frame for export
+  comparison_df <- as.data.frame(comparison_table)
+  
+  # Create a list with model results for Excel export
+  excel_data <- list("Model_Comparison" = comparison_df)
+  
+  # Add individual model summaries if available
+  for(i in 1:length(available_models)) {
+    model_name <- names(available_models)[i]
+    model_summary <- broom::tidy(available_models[[i]])
+    excel_data[[paste0("Detail_", model_name)]] <- model_summary
+  }
+  
+  # Write to Excel
+  write_xlsx(excel_data, excel_file)
+  cat("\nModel results saved to:", excel_file, "\n")
+} else {
+  cat("Only one model available - no comparison table created.\n")
+}
+
+##############################################################
+# SUMMARY STATISTICS
+##############################################################
+cat("\n======= DATA SUMMARY STATISTICS =======\n")
+
+# Summary of key variables
+summary_vars <- c("Y", "flood", "floodday", "temperature", "population")
+if (pop_density_available) summary_vars <- c(summary_vars, "population_density")
+
+cat("Summary of key variables:\n")
+print(data[, ..summary_vars] %>% summary())
+
+# Check for missing values
+cat("\nMissing values by variable:\n")
+missing_summary <- data[, lapply(.SD, function(x) sum(is.na(x))), .SDcols = summary_vars]
+print(missing_summary)
+
+# Final message
+cat("\n======= ANALYSIS COMPLETE =======\n")
+if (offset_available) {
+  cat("✓ Population offset (log_population_offset) was used in all models\n")
+} else {
+  cat("⚠ No population offset was available\n")
+}
+
+if (pop_density_available) {
+  cat("✓ Population density (log_population_density) was included in socioeconomic models\n")
+} else {
+  cat("⚠ Population density variable was not available\n")
+}
+
+cat("Total models estimated:", length(available_models), "\n")
